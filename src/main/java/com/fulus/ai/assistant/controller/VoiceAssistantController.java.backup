@@ -1,0 +1,167 @@
+package com.fulus.ai.assistant.controller;
+
+import com.fulus.ai.assistant.dto.VoiceResponse;
+import com.fulus.ai.assistant.service.VoiceAssistantService;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.core.io.FileSystemResource;
+import org.springframework.core.io.Resource;
+import org.springframework.http.HttpHeaders;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.MediaType;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.*;
+import org.springframework.web.multipart.MultipartFile;
+
+import java.io.File;
+import java.io.IOException;
+
+/**
+ * REST Controller for Voice Assistant
+ *
+ * Endpoints:
+ * - POST /api/v1/voice - Process voice request (upload audio, get text and audio response)
+ * - GET /api/v1/voice/audio/{filename} - Download generated audio response
+ * - DELETE /api/v1/voice/audio/{filename} - Delete audio file
+ */
+@RestController
+@RequestMapping("/api/v1/voice")
+@RequiredArgsConstructor
+@Slf4j
+public class VoiceAssistantController {
+
+    private final VoiceAssistantService voiceAssistantService;
+
+    /**
+     * Process voice request
+     *
+     * Accepts audio file, transcribes it, processes with AI, and generates audio response
+     *
+     * @param userId User ID (from header)
+     * @param audioFile Audio file (WAV, MP3, M4A, MP4, WebM)
+     * @param generateAudio Whether to generate audio response (default: true)
+     * @param voice TTS voice: alloy, echo, fable, onyx, nova, shimmer (default: nova)
+     * @param language Language code for transcription (default: en)
+     * @return VoiceResponse with transcription, AI response, and audio URL
+     */
+    @PostMapping(consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
+    public ResponseEntity<VoiceResponse> processVoice(
+            @RequestHeader(value = "X-User-Id", required = true) String userId,
+            @RequestParam("audioFile") MultipartFile audioFile,
+            @RequestParam(value = "generateAudio", defaultValue = "true") boolean generateAudio,
+            @RequestParam(value = "voice", required = false) String voice,
+            @RequestParam(value = "language", required = false, defaultValue = "en") String language) {
+
+        log.info("Voice request received from user: {}, file: {}, size: {} bytes",
+                userId, audioFile.getOriginalFilename(), audioFile.getSize());
+
+        try {
+            // Validate user ID
+            if (userId == null || userId.trim().isEmpty()) {
+                VoiceResponse errorResponse = VoiceResponse.error("User ID is required in X-User-Id header");
+                return ResponseEntity.badRequest().body(errorResponse);
+            }
+
+            // Process voice request
+            VoiceResponse response = voiceAssistantService.processVoiceRequest(
+                    userId,
+                    audioFile,
+                    generateAudio,
+                    voice
+            );
+
+            if (!response.isSuccess()) {
+                log.warn("Voice processing failed: {}", response.getMessage());
+                return ResponseEntity.badRequest().body(response);
+            }
+
+            log.info("Voice request processed successfully for user: {}", userId);
+            return ResponseEntity.ok(response);
+
+        } catch (IllegalArgumentException e) {
+            log.error("Validation error: {}", e.getMessage());
+            VoiceResponse errorResponse = VoiceResponse.error("Invalid request: " + e.getMessage());
+            return ResponseEntity.badRequest().body(errorResponse);
+
+        } catch (Exception e) {
+            log.error("Error processing voice request for user: {}", userId, e);
+            VoiceResponse errorResponse = VoiceResponse.error(
+                    "An error occurred processing your voice request. Please try again.");
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body(errorResponse);
+        }
+    }
+
+    /**
+     * Download generated audio response
+     *
+     * @param filename Audio filename
+     * @return Audio file
+     */
+    @GetMapping("/audio/{filename}")
+    public ResponseEntity<Resource> downloadAudio(@PathVariable String filename) {
+        log.info("Audio download request: {}", filename);
+
+        try {
+            File audioFile = voiceAssistantService.getAudioFile(filename);
+
+            Resource resource = new FileSystemResource(audioFile);
+
+            HttpHeaders headers = new HttpHeaders();
+            headers.add(HttpHeaders.CONTENT_DISPOSITION, "inline; filename=\"" + filename + "\"");
+            headers.add(HttpHeaders.CONTENT_TYPE, "audio/mpeg");
+
+            log.info("Serving audio file: {}, size: {} bytes", filename, audioFile.length());
+
+            return ResponseEntity.ok()
+                    .headers(headers)
+                    .contentLength(audioFile.length())
+                    .body(resource);
+
+        } catch (IOException e) {
+            log.error("Error retrieving audio file: {}", filename, e);
+            return ResponseEntity.notFound().build();
+        } catch (Exception e) {
+            log.error("Unexpected error retrieving audio file: {}", filename, e);
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).build();
+        }
+    }
+
+    /**
+     * Delete audio file
+     *
+     * @param filename Audio filename
+     * @return Success or error response
+     */
+    @DeleteMapping("/audio/{filename}")
+    public ResponseEntity<VoiceResponse> deleteAudio(
+            @PathVariable String filename,
+            @RequestHeader(value = "X-User-Id", required = true) String userId) {
+
+        log.info("Audio delete request: {} by user: {}", filename, userId);
+
+        try {
+            voiceAssistantService.deleteAudioFile(filename);
+
+            VoiceResponse response = VoiceResponse.builder()
+                    .success(true)
+                    .message("Audio file deleted successfully")
+                    .build();
+
+            log.info("Audio file deleted: {}", filename);
+            return ResponseEntity.ok(response);
+
+        } catch (Exception e) {
+            log.error("Error deleting audio file: {}", filename, e);
+            VoiceResponse errorResponse = VoiceResponse.error("Failed to delete audio file");
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body(errorResponse);
+        }
+    }
+
+    /**
+     * Health check endpoint
+     */
+    @GetMapping("/health")
+    public ResponseEntity<String> health() {
+        return ResponseEntity.ok("Voice Assistant Service is running");
+    }
+}

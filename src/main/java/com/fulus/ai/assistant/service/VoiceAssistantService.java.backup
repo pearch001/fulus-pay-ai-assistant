@@ -1,0 +1,396 @@
+package com.fulus.ai.assistant.service;
+
+import com.fulus.ai.assistant.dto.VoiceResponse;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.ai.openai.OpenAiAudioSpeechModel;
+import org.springframework.ai.openai.OpenAiAudioTranscriptionModel;
+import org.springframework.ai.openai.audio.speech.SpeechPrompt;
+import org.springframework.ai.openai.audio.speech.SpeechResponse;
+import org.springframework.ai.openai.audio.transcription.AudioTranscriptionPrompt;
+import org.springframework.ai.openai.audio.transcription.AudioTranscriptionResponse;
+import org.springframework.ai.openai.api.OpenAiAudioApi;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.core.io.FileSystemResource;
+import org.springframework.core.io.Resource;
+import org.springframework.stereotype.Service;
+import org.springframework.web.multipart.MultipartFile;
+
+import jakarta.annotation.PostConstruct;
+import jakarta.annotation.PreDestroy;
+import java.io.File;
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.nio.file.StandardCopyOption;
+import java.time.LocalDateTime;
+import java.time.format.DateTimeFormatter;
+import java.util.Arrays;
+import java.util.List;
+import java.util.Set;
+import java.util.UUID;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
+
+/**
+ * Voice Assistant Service
+ *
+ * Handles voice interactions:
+ * 1. Speech-to-Text (OpenAI Whisper)
+ * 2. AI Processing
+ * 3. Text-to-Speech (OpenAI TTS)
+ */
+@Service
+@RequiredArgsConstructor
+@Slf4j
+public class VoiceAssistantService {
+
+    private final AIFinancialAssistantService aiAssistantService;
+    private final OpenAiAudioTranscriptionModel transcriptionModel;
+    private final OpenAiAudioSpeechModel speechModel;
+
+    @Value("${voice.upload.directory:${java.io.tmpdir}/fulus-voice}")
+    private String uploadDirectory;
+
+    @Value("${voice.max-file-size:10485760}") // 10MB default
+    private long maxFileSize;
+
+    @Value("${voice.tts.voice:nova}") // Default TTS voice
+    private String defaultTtsVoice;
+
+    @Value("${voice.cleanup.enabled:true}")
+    private boolean cleanupEnabled;
+
+    @Value("${voice.cleanup.age-hours:24}")
+    private int cleanupAgeHours;
+
+    private static final Set<String> SUPPORTED_AUDIO_FORMATS = Set.of(
+            "audio/mpeg", "audio/mp3",
+            "audio/wav", "audio/wave",
+            "audio/mp4", "audio/m4a",
+            "audio/webm"
+    );
+
+    private static final List<String> SUPPORTED_FILE_EXTENSIONS = Arrays.asList(
+            "mp3", "wav", "m4a", "mp4", "webm"
+    );
+
+    private ScheduledExecutorService cleanupScheduler;
+
+    /**
+     * Initialize upload directory and cleanup scheduler
+     */
+    @PostConstruct
+    public void initialize() {
+        try {
+            // Create upload directory
+            Path uploadPath = Paths.get(uploadDirectory);
+            if (!Files.exists(uploadPath)) {
+                Files.createDirectories(uploadPath);
+                log.info("Created voice upload directory: {}", uploadDirectory);
+            }
+
+            // Start cleanup scheduler
+            if (cleanupEnabled) {
+                cleanupScheduler = Executors.newSingleThreadScheduledExecutor();
+                cleanupScheduler.scheduleAtFixedRate(
+                        this::cleanupOldFiles,
+                        1, // Initial delay
+                        6, // Period (every 6 hours)
+                        TimeUnit.HOURS
+                );
+                log.info("Voice file cleanup scheduler started (cleaning files older than {} hours)", cleanupAgeHours);
+            }
+
+        } catch (IOException e) {
+            log.error("Failed to initialize voice upload directory", e);
+        }
+    }
+
+    /**
+     * Shutdown cleanup scheduler
+     */
+    @PreDestroy
+    public void shutdown() {
+        if (cleanupScheduler != null && !cleanupScheduler.isShutdown()) {
+            cleanupScheduler.shutdown();
+            log.info("Voice file cleanup scheduler shutdown");
+        }
+    }
+
+    /**
+     * Process voice request end-to-end
+     *
+     * @param userId User ID
+     * @param audioFile Audio file from user
+     * @param generateAudio Whether to generate audio response
+     * @param voice TTS voice (optional)
+     * @return VoiceResponse with transcription, AI response, and audio
+     */
+    public VoiceResponse processVoiceRequest(
+            String userId,
+            MultipartFile audioFile,
+            boolean generateAudio,
+            String voice) {
+
+        long startTime = System.currentTimeMillis();
+        File tempInputFile = null;
+        File tempOutputFile = null;
+
+        try {
+            // 1. Validate audio file
+            log.info("Processing voice request for user: {}", userId);
+            validateAudioFile(audioFile);
+
+            // 2. Save uploaded audio temporarily
+            tempInputFile = saveTemporaryFile(audioFile, "input");
+            log.debug("Saved input audio: {}", tempInputFile.getAbsolutePath());
+
+            // 3. Transcribe audio using OpenAI Whisper
+            String transcribedText = transcribeAudio(tempInputFile);
+            log.info("Transcribed text: {}", transcribedText);
+
+            if (transcribedText == null || transcribedText.trim().isEmpty()) {
+                return VoiceResponse.error("Failed to transcribe audio. Please speak clearly and try again.");
+            }
+
+            // 4. Process with AI assistant
+            String aiResponse = aiAssistantService.processQuery(userId, transcribedText);
+            log.info("AI response generated. Length: {} characters", aiResponse.length());
+
+            // 5. Generate audio response (if requested)
+            String audioResponseUrl = null;
+            if (generateAudio) {
+                tempOutputFile = generateSpeech(aiResponse, voice != null ? voice : defaultTtsVoice);
+                audioResponseUrl = "/api/v1/voice/audio/" + tempOutputFile.getName();
+                log.info("Generated audio response: {}", audioResponseUrl);
+            }
+
+            // 6. Calculate processing time
+            long processingTime = System.currentTimeMillis() - startTime;
+
+            // 7. Build response
+            VoiceResponse response = VoiceResponse.success(
+                    transcribedText,
+                    aiResponse,
+                    audioResponseUrl,
+                    userId,
+                    processingTime
+            );
+
+            if (tempOutputFile != null) {
+                response.setAudioFormat("mp3");
+                response.setAudioFileSize(tempOutputFile.length());
+            }
+
+            log.info("Voice request processed successfully in {}ms", processingTime);
+            return response;
+
+        } catch (IllegalArgumentException e) {
+            log.error("Validation error: {}", e.getMessage());
+            return VoiceResponse.error(e.getMessage());
+        } catch (Exception e) {
+            log.error("Error processing voice request for user: {}", userId, e);
+            return VoiceResponse.error("An error occurred processing your voice request. Please try again.");
+        } finally {
+            // Cleanup input file (output file kept for download)
+            if (tempInputFile != null && tempInputFile.exists()) {
+                if (tempInputFile.delete()) {
+                    log.debug("Cleaned up temporary input file: {}", tempInputFile.getName());
+                }
+            }
+        }
+    }
+
+    /**
+     * Validate audio file
+     */
+    private void validateAudioFile(MultipartFile file) {
+        if (file == null || file.isEmpty()) {
+            throw new IllegalArgumentException("Audio file is required");
+        }
+
+        // Check file size
+        if (file.getSize() > maxFileSize) {
+            throw new IllegalArgumentException(
+                    String.format("File size exceeds maximum allowed size of %d MB",
+                            maxFileSize / (1024 * 1024)));
+        }
+
+        // Check content type
+        String contentType = file.getContentType();
+        if (contentType == null || !SUPPORTED_AUDIO_FORMATS.contains(contentType.toLowerCase())) {
+            throw new IllegalArgumentException(
+                    "Unsupported audio format. Supported formats: MP3, WAV, M4A, MP4, WebM");
+        }
+
+        // Check file extension
+        String originalFilename = file.getOriginalFilename();
+        if (originalFilename != null) {
+            String extension = getFileExtension(originalFilename).toLowerCase();
+            if (!SUPPORTED_FILE_EXTENSIONS.contains(extension)) {
+                throw new IllegalArgumentException(
+                        "Unsupported file extension. Supported: " + SUPPORTED_FILE_EXTENSIONS);
+            }
+        }
+
+        log.debug("Audio file validation passed: {} ({} bytes)", originalFilename, file.getSize());
+    }
+
+    /**
+     * Save uploaded file temporarily
+     */
+    private File saveTemporaryFile(MultipartFile file, String prefix) throws IOException {
+        String originalFilename = file.getOriginalFilename();
+        String extension = originalFilename != null ? getFileExtension(originalFilename) : "mp3";
+        String timestamp = LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyyMMdd_HHmmss"));
+        String filename = String.format("%s_%s_%s.%s", prefix, timestamp, UUID.randomUUID().toString().substring(0, 8), extension);
+
+        Path filePath = Paths.get(uploadDirectory, filename);
+        Files.copy(file.getInputStream(), filePath, StandardCopyOption.REPLACE_EXISTING);
+
+        return filePath.toFile();
+    }
+
+    /**
+     * Transcribe audio using OpenAI Whisper
+     */
+    private String transcribeAudio(File audioFile) {
+        try {
+            log.debug("Transcribing audio file: {}", audioFile.getName());
+
+            Resource audioResource = new FileSystemResource(audioFile);
+            AudioTranscriptionPrompt transcriptionPrompt = new AudioTranscriptionPrompt(audioResource);
+
+            AudioTranscriptionResponse response = transcriptionModel.call(transcriptionPrompt);
+            String transcription = response.getResult().getOutput();
+
+            log.info("Transcription successful. Length: {} characters", transcription.length());
+            return transcription;
+
+        } catch (Exception e) {
+            log.error("Error transcribing audio", e);
+            throw new RuntimeException("Failed to transcribe audio: " + e.getMessage(), e);
+        }
+    }
+
+    /**
+     * Generate speech from text using OpenAI TTS
+     */
+    private File generateSpeech(String text, String voice) {
+        try {
+            log.debug("Generating speech with voice: {}", voice);
+
+            // Create speech prompt with options
+            SpeechPrompt speechPrompt = new SpeechPrompt(text,
+                    OpenAiAudioApi.SpeechRequest.AudioResponseFormat.MP3,
+                    getVoiceEnum(voice),
+                    1.0f // Normal speed
+            );
+
+            SpeechResponse response = speechModel.call(speechPrompt);
+            byte[] audioBytes = response.getResult().getOutput();
+
+            // Save to file
+            String timestamp = LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyyMMdd_HHmmss"));
+            String filename = String.format("response_%s_%s.mp3", timestamp, UUID.randomUUID().toString().substring(0, 8));
+            Path outputPath = Paths.get(uploadDirectory, filename);
+
+            Files.write(outputPath, audioBytes);
+
+            log.info("Speech generated successfully. File: {}, Size: {} bytes", filename, audioBytes.length);
+            return outputPath.toFile();
+
+        } catch (Exception e) {
+            log.error("Error generating speech", e);
+            throw new RuntimeException("Failed to generate speech: " + e.getMessage(), e);
+        }
+    }
+
+    /**
+     * Get TTS voice enum
+     */
+    private OpenAiAudioApi.SpeechRequest.Voice getVoiceEnum(String voice) {
+        try {
+            return OpenAiAudioApi.SpeechRequest.Voice.valueOf(voice.toUpperCase());
+        } catch (IllegalArgumentException e) {
+            log.warn("Invalid voice: {}, using default: {}", voice, defaultTtsVoice);
+            return OpenAiAudioApi.SpeechRequest.Voice.valueOf(defaultTtsVoice.toUpperCase());
+        }
+    }
+
+    /**
+     * Get audio file by filename
+     */
+    public File getAudioFile(String filename) throws IOException {
+        // Sanitize filename to prevent directory traversal
+        String sanitizedFilename = Paths.get(filename).getFileName().toString();
+
+        Path filePath = Paths.get(uploadDirectory, sanitizedFilename);
+        File file = filePath.toFile();
+
+        if (!file.exists() || !file.isFile()) {
+            throw new IOException("Audio file not found: " + sanitizedFilename);
+        }
+
+        return file;
+    }
+
+    /**
+     * Delete audio file
+     */
+    public void deleteAudioFile(String filename) {
+        try {
+            String sanitizedFilename = Paths.get(filename).getFileName().toString();
+            Path filePath = Paths.get(uploadDirectory, sanitizedFilename);
+            Files.deleteIfExists(filePath);
+            log.debug("Deleted audio file: {}", sanitizedFilename);
+        } catch (IOException e) {
+            log.error("Error deleting audio file: {}", filename, e);
+        }
+    }
+
+    /**
+     * Cleanup old files (scheduled task)
+     */
+    private void cleanupOldFiles() {
+        try {
+            Path uploadPath = Paths.get(uploadDirectory);
+            if (!Files.exists(uploadPath)) {
+                return;
+            }
+
+            long cutoffTime = System.currentTimeMillis() - (cleanupAgeHours * 3600000L);
+            int deletedCount = 0;
+
+            File[] files = uploadPath.toFile().listFiles();
+            if (files != null) {
+                for (File file : files) {
+                    if (file.isFile() && file.lastModified() < cutoffTime) {
+                        if (file.delete()) {
+                            deletedCount++;
+                            log.trace("Deleted old audio file: {}", file.getName());
+                        }
+                    }
+                }
+            }
+
+            if (deletedCount > 0) {
+                log.info("Cleanup completed: deleted {} old audio files", deletedCount);
+            }
+
+        } catch (Exception e) {
+            log.error("Error during audio file cleanup", e);
+        }
+    }
+
+    /**
+     * Get file extension
+     */
+    private String getFileExtension(String filename) {
+        int lastDot = filename.lastIndexOf('.');
+        return (lastDot == -1) ? "" : filename.substring(lastDot + 1);
+    }
+}

@@ -1,0 +1,630 @@
+# NFC Offline Payment Payload Specification
+
+## Version: 1.0
+
+This document defines the structure and requirements for NFC-based offline payment transactions in the Fulus Pay AI Assistant application.
+
+---
+
+## Table of Contents
+
+1. [Overview](#overview)
+2. [Payload Structure](#payload-structure)
+3. [Field Specifications](#field-specifications)
+4. [Security Requirements](#security-requirements)
+5. [Validation Rules](#validation-rules)
+6. [Size Constraints](#size-constraints)
+7. [Implementation Examples](#implementation-examples)
+8. [Error Handling](#error-handling)
+9. [Mobile Integration Guide](#mobile-integration-guide)
+
+---
+
+## Overview
+
+The NFC offline payment system allows users to transfer funds using Near Field Communication (NFC) when internet connectivity is unavailable. Transactions are stored locally and synchronized with the backend when connectivity is restored.
+
+### Key Features
+
+- **Maximum Payload Size**: 4KB (4096 bytes) for NFC compatibility
+- **Payload Format**: JSON
+- **Version**: 1.0
+- **Supported Currency**: NGN (Nigerian Naira)
+- **Timestamp Validity**: 5 minutes
+- **Hash Algorithm**: SHA-256
+- **Signature Algorithm**: RSA-2048 or ECDSA P-256
+
+---
+
+## Payload Structure
+
+### Complete JSON Structure
+
+```json
+{
+  "version": "1.0",
+  "type": "OFFLINE_PAYMENT",
+  "sender": {
+    "phoneNumber": "08012345678",
+    "publicKey": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA...",
+    "deviceId": "DEVICE-12345678"
+  },
+  "recipient": {
+    "phoneNumber": "08087654321",
+    "publicKey": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA..."
+  },
+  "transaction": {
+    "amount": 1000.00,
+    "currency": "NGN",
+    "timestamp": 1734567890123,
+    "nonce": "550e8400-e29b-41d4-a716-446655440000",
+    "note": "Payment for goods"
+  },
+  "security": {
+    "hash": "a7f8b3c9d2e1f4g5h6i7j8k9l0m1n2o3p4q5r6s7t8u9v0w1x2y3z4a5b6c7d8e9f0",
+    "previousHash": "0000000000000000000000000000000000000000000000000000000000000000",
+    "signature": "SGVsbG8gV29ybGQh..."
+  }
+}
+```
+
+---
+
+## Field Specifications
+
+### 1. Root Level Fields
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `version` | String | Yes | Protocol version. Current: "1.0" |
+| `type` | String | Yes | Payload type. Must be: "OFFLINE_PAYMENT" |
+| `sender` | Object | Yes | Sender information |
+| `recipient` | Object | Yes | Recipient information |
+| `transaction` | Object | Yes | Transaction details |
+| `security` | Object | Yes | Security information |
+
+### 2. Sender Object
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `phoneNumber` | String | Yes | Sender's phone number (E.164 format recommended) |
+| `publicKey` | String | Yes | Sender's public key (Base64 encoded) |
+| `deviceId` | String | Yes | Unique device identifier |
+
+**Phone Number Format**:
+- Minimum: 10 digits
+- Maximum: 15 digits
+- Example: "08012345678" or "+2348012345678"
+
+**Public Key Format**:
+- Base64 encoded
+- RSA-2048 or ECDSA P-256
+- Example length: 392-450 characters (RSA-2048)
+
+### 3. Recipient Object
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `phoneNumber` | String | Yes | Recipient's phone number |
+| `publicKey` | String | Yes | Recipient's public key (Base64 encoded) |
+
+### 4. Transaction Object
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `amount` | Number | Yes | Payment amount (must be > 0) |
+| `currency` | String | Yes | Currency code. Currently: "NGN" |
+| `timestamp` | Long | Yes | Unix timestamp in milliseconds |
+| `nonce` | String | Yes | Unique transaction identifier (UUID format) |
+| `note` | String | No | Optional payment description |
+
+**Amount Format**:
+- Decimal number
+- Precision: 2 decimal places
+- Minimum: 0.01
+- Example: 1000.00, 50.50
+
+**Timestamp Format**:
+- Unix timestamp in milliseconds
+- Must be within ±5 minutes of current time
+- Example: 1734567890123
+
+**Nonce Format**:
+- UUID v4 format
+- Example: "550e8400-e29b-41d4-a716-446655440000"
+- Must be unique per transaction
+- Used to prevent replay attacks
+
+### 5. Security Object
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `hash` | String | Yes | SHA-256 hash of transaction data |
+| `previousHash` | String | Yes | Hash of previous transaction (chain) |
+| `signature` | String | Yes | Digital signature of transaction hash |
+
+**Hash Format**:
+- SHA-256 hex string
+- Length: 64 characters
+- Lowercase hexadecimal
+
+**Hash Calculation**:
+```
+data = senderPhone + recipientPhone + amount + timestamp + nonce + previousHash
+hash = SHA-256(data)
+```
+
+**Previous Hash**:
+- For first transaction: "0000000000000000000000000000000000000000000000000000000000000000"
+- For subsequent transactions: hash of previous transaction
+
+**Signature Format**:
+- Base64 encoded
+- Generated by signing the transaction hash with sender's private key
+- Algorithm: SHA256withRSA or SHA256withECDSA
+
+---
+
+## Security Requirements
+
+### 1. Hash Chain Integrity
+
+Each transaction must link to the previous transaction via `previousHash`, creating a blockchain-like chain:
+
+```
+Transaction 1 (genesis):
+  hash: "a7f8b3c9d2e1..."
+  previousHash: "0000000000..."
+
+Transaction 2:
+  hash: "b8g9c0d3e2..."
+  previousHash: "a7f8b3c9d2e1..." (hash from Transaction 1)
+
+Transaction 3:
+  hash: "c9h0d4e3f1..."
+  previousHash: "b8g9c0d3e2..." (hash from Transaction 2)
+```
+
+### 2. Digital Signature
+
+**Signing Process** (Mobile Device):
+1. Generate transaction hash
+2. Sign hash with user's private key (stored securely on device)
+3. Include signature in payload
+
+**Verification Process** (Backend):
+1. Extract transaction hash from payload
+2. Extract signature from payload
+3. Verify signature using sender's public key
+4. Ensure signature matches the hash
+
+### 3. Nonce Management
+
+- Generate unique UUID for each transaction
+- Store used nonces for 7 days
+- Reject transactions with duplicate nonces
+- Prevents replay attacks
+
+### 4. Timestamp Validation
+
+- Reject transactions with timestamps > 5 minutes old
+- Reject transactions with future timestamps > 5 minutes
+- Protects against stale transactions
+
+---
+
+## Validation Rules
+
+### Backend Validation Checklist
+
+The backend performs the following validations:
+
+1. ✓ **Size Check**: Payload ≤ 4KB
+2. ✓ **Version Check**: version = "1.0"
+3. ✓ **Type Check**: type = "OFFLINE_PAYMENT"
+4. ✓ **Required Fields**: All mandatory fields present
+5. ✓ **Phone Number Format**: Valid format
+6. ✓ **Amount Validation**: amount > 0
+7. ✓ **Currency Check**: currency = "NGN"
+8. ✓ **Timestamp Freshness**: within ±5 minutes
+9. ✓ **Nonce Uniqueness**: not previously used
+10. ✓ **Hash Verification**: calculated hash matches provided hash
+11. ✓ **Signature Verification**: signature valid with sender's public key
+12. ✓ **Chain Integrity**: previousHash matches last transaction
+
+### Validation Result
+
+```json
+{
+  "valid": true,
+  "signatureValid": true,
+  "hashValid": true,
+  "timestampValid": true,
+  "nonceValid": true,
+  "sizeCompatible": true,
+  "versionSupported": true,
+  "errors": [],
+  "warnings": []
+}
+```
+
+---
+
+## Size Constraints
+
+### Maximum Payload Size: 4KB (4096 bytes)
+
+**Size Optimization Tips**:
+
+1. **Minimize Note Field**: Keep payment notes concise
+2. **Compact Keys**: Use compressed key formats where possible
+3. **Remove Whitespace**: Minify JSON (no pretty-printing)
+4. **Essential Data Only**: Include only required fields
+
+### Size Breakdown (Typical)
+
+| Component | Approximate Size |
+|-----------|------------------|
+| Root structure | 50 bytes |
+| Sender data | 500-600 bytes |
+| Recipient data | 450-550 bytes |
+| Transaction data | 150-250 bytes |
+| Security data | 500-700 bytes |
+| **Total** | **1650-2150 bytes** |
+
+**Remaining Space**: ~2KB for longer notes or additional fields
+
+---
+
+## Implementation Examples
+
+### Example 1: Create NFC Payload (Java)
+
+```java
+// Backend - Generate NFC payload
+String payloadJson = nfcPayloadService.createNFCPayload(
+    senderId,           // "550e8400-e29b-41d4-a716-446655440000"
+    recipientId,        // "660f9511-f3ac-52e5-b827-557766551111"
+    1000.00,           // amount
+    "Payment for lunch" // note
+);
+
+// Check size
+boolean compatible = nfcPayloadService.isPayloadSizeCompatible(payloadJson);
+```
+
+### Example 2: Validate NFC Payload (Java)
+
+```java
+// Backend - Validate received NFC payload
+NFCValidationResult result = nfcPayloadService.validateNFCPayload(payloadJson);
+
+if (result.isValid()) {
+    // Extract and store transaction
+    OfflineTransaction transaction = nfcPayloadService.extractTransactionFromPayload(payloadJson);
+    offlineTransactionRepository.save(transaction);
+} else {
+    // Handle validation errors
+    System.out.println("Validation failed: " + result.getErrors());
+}
+```
+
+### Example 3: Mobile App - Generate Payload (Pseudocode)
+
+```kotlin
+// Mobile (Kotlin) - Generate NFC payload
+fun generateNFCPayload(
+    senderPhone: String,
+    recipientPhone: String,
+    amount: Double,
+    note: String
+): String {
+    // 1. Get sender's keys from secure storage
+    val senderPrivateKey = keyStore.getPrivateKey()
+    val senderPublicKey = keyStore.getPublicKey()
+
+    // 2. Get recipient's public key (from QR or contact)
+    val recipientPublicKey = getRecipientPublicKey(recipientPhone)
+
+    // 3. Generate transaction data
+    val nonce = UUID.randomUUID().toString()
+    val timestamp = System.currentTimeMillis()
+    val previousHash = getLastTransactionHash() ?: GENESIS_HASH
+
+    // 4. Calculate hash
+    val hashData = "$senderPhone$recipientPhone$amount$timestamp$nonce$previousHash"
+    val hash = SHA256.hash(hashData)
+
+    // 5. Sign hash
+    val signature = signData(hash, senderPrivateKey)
+
+    // 6. Build payload
+    val payload = NFCPayload(
+        version = "1.0",
+        type = "OFFLINE_PAYMENT",
+        sender = Sender(senderPhone, senderPublicKey, getDeviceId()),
+        recipient = Recipient(recipientPhone, recipientPublicKey),
+        transaction = Transaction(amount, "NGN", timestamp, nonce, note),
+        security = Security(hash, previousHash, signature)
+    )
+
+    // 7. Serialize to JSON
+    return Json.encodeToString(payload)
+}
+```
+
+### Example 4: Mobile App - Send via NFC (Pseudocode)
+
+```kotlin
+// Mobile (Kotlin) - Send NFC payload
+fun sendNFCPayment(recipientPhone: String, amount: Double, note: String) {
+    // 1. Generate payload
+    val payloadJson = generateNFCPayload(
+        senderPhone = getCurrentUserPhone(),
+        recipientPhone = recipientPhone,
+        amount = amount,
+        note = note
+    )
+
+    // 2. Check size
+    if (payloadJson.toByteArray().size > 4096) {
+        throw PayloadTooLargeException("Payload exceeds 4KB limit")
+    }
+
+    // 3. Send via NFC
+    nfcAdapter.sendMessage(payloadJson)
+
+    // 4. Store locally as pending
+    localDb.saveTransaction(payloadJson, status = "PENDING")
+}
+```
+
+### Example 5: Mobile App - Receive via NFC (Pseudocode)
+
+```kotlin
+// Mobile (Kotlin) - Receive NFC payload
+fun onNFCMessageReceived(payloadJson: String) {
+    try {
+        // 1. Parse payload
+        val payload = Json.decodeFromString<NFCPayload>(payloadJson)
+
+        // 2. Validate locally
+        if (!validatePayloadLocally(payload)) {
+            showError("Invalid payment data")
+            return
+        }
+
+        // 3. Show confirmation to user
+        showPaymentConfirmation(payload)
+
+        // 4. If accepted, store locally
+        localDb.saveReceivedTransaction(payloadJson, status = "RECEIVED")
+
+        // 5. Sync when online
+        if (isOnline()) {
+            syncTransactions()
+        }
+    } catch (e: Exception) {
+        showError("Failed to process payment: ${e.message}")
+    }
+}
+```
+
+---
+
+## Error Handling
+
+### Common Validation Errors
+
+| Error Code | Error Message | Resolution |
+|------------|---------------|------------|
+| `PAYLOAD_TOO_LARGE` | Payload exceeds 4KB limit | Reduce note length or remove optional fields |
+| `INVALID_VERSION` | Unsupported version | Update app to latest version |
+| `INVALID_SIGNATURE` | Signature verification failed | Regenerate signature with correct private key |
+| `HASH_MISMATCH` | Hash verification failed | Possible tampering - reject transaction |
+| `NONCE_REUSED` | Nonce already used | Generate new unique nonce |
+| `TIMESTAMP_EXPIRED` | Timestamp too old | Generate new transaction with current timestamp |
+| `INVALID_AMOUNT` | Amount must be > 0 | Check amount value |
+| `MISSING_FIELDS` | Required fields missing | Ensure all mandatory fields are present |
+
+### Error Response Format
+
+```json
+{
+  "valid": false,
+  "errors": [
+    "Timestamp not fresh: 6 minutes old (max 5 minutes)",
+    "Hash verification failed - payload may be tampered"
+  ],
+  "warnings": [
+    "Signature not verified (placeholder signature)"
+  ]
+}
+```
+
+---
+
+## Mobile Integration Guide
+
+### Prerequisites
+
+1. **Key Pair Generation**
+   - Generate RSA-2048 or ECDSA P-256 key pair on device
+   - Store private key securely (Android Keystore / iOS Keychain)
+   - Upload public key to backend during registration
+
+2. **NFC Capabilities**
+   - Android: NFC permission in manifest
+   - iOS: Core NFC framework
+   - Check NFC availability at runtime
+
+### Integration Steps
+
+#### Step 1: Initialize NFC
+
+```kotlin
+// Android
+val nfcAdapter = NfcAdapter.getDefaultAdapter(context)
+if (nfcAdapter == null || !nfcAdapter.isEnabled) {
+    // NFC not available or disabled
+}
+```
+
+#### Step 2: Generate Keys (First Time)
+
+```kotlin
+val keyPair = cryptoService.generateKeyPair("RSA", 2048)
+val publicKeyBase64 = Base64.encodeToString(keyPair.public.encoded, Base64.NO_WRAP)
+
+// Upload to backend
+api.registerPublicKey(userId, publicKeyBase64)
+
+// Store private key securely
+keyStore.storePrivateKey(keyPair.private)
+```
+
+#### Step 3: Send Payment
+
+```kotlin
+// Generate payload
+val payload = nfcPayloadService.generatePayload(
+    recipientPhone = recipientPhone,
+    amount = amount,
+    note = note
+)
+
+// Send via NFC
+nfcAdapter.sendMessage(payload)
+```
+
+#### Step 4: Receive Payment
+
+```kotlin
+override fun onNfcMessageReceived(message: String) {
+    // Validate and process
+    val validation = nfcPayloadService.validatePayload(message)
+
+    if (validation.valid) {
+        // Show confirmation
+        showPaymentDialog(validation.payload)
+    } else {
+        // Show errors
+        showErrorDialog(validation.errors)
+    }
+}
+```
+
+#### Step 5: Sync Transactions
+
+```kotlin
+fun syncOfflineTransactions() {
+    val pendingTransactions = localDb.getPendingTransactions()
+
+    api.batchSyncTransactions(userId, pendingTransactions)
+        .onSuccess { result ->
+            // Update local status
+            localDb.updateSyncStatus(result.syncedTransactions)
+        }
+        .onFailure { error ->
+            // Handle sync errors
+            handleSyncError(error)
+        }
+}
+```
+
+---
+
+## API Endpoints
+
+### 1. Validate NFC Payload (Optional)
+
+```http
+POST /api/offline/nfc/validate
+Content-Type: application/json
+
+{
+  "payloadJson": "{ \"version\": \"1.0\", ... }"
+}
+```
+
+**Response:**
+```json
+{
+  "valid": true,
+  "signatureValid": true,
+  "hashValid": true,
+  "errors": [],
+  "warnings": []
+}
+```
+
+### 2. Batch Sync Transactions
+
+```http
+POST /api/offline/transactions/batch-sync
+Content-Type: application/json
+
+{
+  "userId": "550e8400-e29b-41d4-a716-446655440000",
+  "transactions": [
+    {
+      "senderPhoneNumber": "08012345678",
+      "recipientPhoneNumber": "08087654321",
+      "amount": 1000.00,
+      "transactionHash": "a7f8b3c9...",
+      "previousHash": "b8g9c0d3...",
+      "signature": "SGVsbG8...",
+      "nonce": "550e8400...",
+      "timestamp": "2024-12-18T10:30:00"
+    }
+  ]
+}
+```
+
+---
+
+## Best Practices
+
+### For Mobile Developers
+
+1. **Always validate locally before sending via NFC**
+2. **Store transactions locally until synced**
+3. **Implement retry logic for failed syncs**
+4. **Show clear status indicators (Pending/Synced/Failed)**
+5. **Handle NFC disconnections gracefully**
+6. **Validate payload size before sending**
+7. **Use secure storage for private keys**
+8. **Implement proper error messages for users**
+
+### For Backend Developers
+
+1. **Always validate all fields on the backend**
+2. **Log security alerts for invalid signatures/hashes**
+3. **Implement rate limiting on sync endpoints**
+4. **Monitor for replay attacks (duplicate nonces)**
+5. **Cleanup expired nonces periodically**
+6. **Store raw payload for audit purposes**
+7. **Implement transaction rollback on sync failures**
+
+---
+
+## Version History
+
+| Version | Date | Changes |
+|---------|------|---------|
+| 1.0 | 2024-12-18 | Initial specification |
+
+---
+
+## Support
+
+For questions or issues, contact:
+- **Email**: dev@fulus.ai
+- **Documentation**: https://docs.fulus.ai/offline-payments
+- **GitHub Issues**: https://github.com/fulus-ai/assistant/issues
+
+---
+
+## License
+
+Copyright © 2024 Fulus AI. All rights reserved.

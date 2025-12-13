@@ -1,0 +1,41 @@
+[Unit]
+Description=Fulus Pay AI Assistant Docker Compose Service (Free Tier)
+Requires=docker.service
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=/home/ubuntu/fulus-pay-ai-assistant
+User=ubuntu
+Group=ubuntu
+
+# Environment file with secrets
+EnvironmentFile=/home/ubuntu/fulus-pay-ai-assistant/.env
+
+# Start command for FREE TIER
+ExecStart=/usr/local/bin/docker-compose -f docker-compose.free-tier.yml up -d
+
+# Stop command
+ExecStop=/usr/local/bin/docker-compose -f docker-compose.free-tier.yml down
+
+# Restart policy (longer delay for free tier)
+Restart=on-failure
+RestartSec=30s
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=fulus-pay-free-tier
+
+# Security settings
+NoNewPrivileges=yes
+PrivateTmp=yes
+
+# Resource limits for free tier
+MemoryLimit=900M
+CPUQuota=90%
+
+[Install]
+WantedBy=multi-user.target

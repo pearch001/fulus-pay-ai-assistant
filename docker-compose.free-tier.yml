@@ -1,0 +1,159 @@
+version: '3.8'
+
+# Free Tier Docker Compose Configuration
+# Optimized for AWS t2.micro / t3.micro (1GB RAM, 1 vCPU)
+
+services:
+  postgres:
+    image: postgres:15-alpine
+    container_name: fulus-postgres
+    restart: unless-stopped
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_DB: ${DB_NAME:-fulus_ai_db}
+      POSTGRES_USER: ${DB_USERNAME:-fulus_user}
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+      POSTGRES_INITDB_ARGS: "-E UTF8"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    # CRITICAL: Limit memory for free tier
+    mem_limit: 200m
+    mem_reservation: 128m
+    cpus: 0.25
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U fulus_user -d fulus_ai_db"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    networks:
+      - fulus-network
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "5m"
+        max-file: "2"
+    # PostgreSQL optimization for low memory
+    command: >
+      postgres
+      -c shared_buffers=32MB
+      -c effective_cache_size=128MB
+      -c maintenance_work_mem=16MB
+      -c checkpoint_completion_target=0.9
+      -c wal_buffers=1MB
+      -c default_statistics_target=50
+      -c random_page_cost=1.1
+      -c effective_io_concurrency=200
+      -c work_mem=1MB
+      -c min_wal_size=256MB
+      -c max_wal_size=512MB
+
+  redis:
+    image: redis:7-alpine
+    container_name: fulus-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    command: >
+      redis-server
+      --requirepass ${REDIS_PASSWORD:-redis_password}
+      --maxmemory 128mb
+      --maxmemory-policy allkeys-lru
+      --save 300 1
+      --loglevel warning
+      --tcp-backlog 128
+      --databases 8
+    volumes:
+      - redis_data:/data
+    # CRITICAL: Limit memory for free tier
+    mem_limit: 150m
+    mem_reservation: 100m
+    cpus: 0.15
+    healthcheck:
+      test: ["CMD", "redis-cli", "--raw", "incr", "ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    networks:
+      - fulus-network
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "5m"
+        max-file: "2"
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile.free-tier
+    image: fulus-pay:free-tier
+    container_name: fulus-app
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      SPRING_PROFILES_ACTIVE: ${SPRING_PROFILE:-dev}
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/${DB_NAME:-fulus_ai_db}
+      SPRING_DATASOURCE_USERNAME: ${DB_USERNAME:-fulus_user}
+      SPRING_DATASOURCE_PASSWORD: ${DB_PASSWORD}
+      SPRING_AI_OPENAI_API_KEY: ${OPENAI_API_KEY}
+      SPRING_AI_OPENAI_CHAT_MODEL: ${OPENAI_MODEL:-gpt-3.5-turbo}
+      JWT_SECRET: ${JWT_SECRET}
+      JWT_EXPIRATION: ${JWT_EXPIRATION:-86400000}
+      JWT_REFRESH_EXPIRATION: ${JWT_REFRESH_EXPIRATION:-604800000}
+
+      # Redis Configuration (Free Tier Optimized)
+      SPRING_REDIS_HOST: redis
+      SPRING_REDIS_PORT: 6379
+      SPRING_REDIS_PASSWORD: ${REDIS_PASSWORD:-redis_password}
+      SPRING_CACHE_TYPE: redis
+      SPRING_CACHE_REDIS_TIME_TO_LIVE: ${CACHE_TTL:-1800000}
+
+      # CRITICAL: JVM settings for 1GB system
+      JAVA_OPTS: >-
+        -Xms256m
+        -Xmx450m
+        -XX:MetaspaceSize=64m
+        -XX:MaxMetaspaceSize=128m
+        -XX:+UseSerialGC
+        -XX:MinHeapFreeRatio=20
+        -XX:MaxHeapFreeRatio=40
+        -XX:+TieredCompilation
+        -XX:TieredStopAtLevel=1
+        -Djava.security.egd=file:/dev/./urandom
+        -Dspring.jmx.enabled=false
+        -Dspring.main.lazy-initialization=true
+    volumes:
+      - ./logs:/app/logs
+      - ./audio_uploads:/app/audio_uploads
+      - ./audio_responses:/app/audio_responses
+    # CRITICAL: Limit memory (reduced from 640m to accommodate Redis)
+    mem_limit: 550m
+    mem_reservation: 450m
+    cpus: 0.6
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - fulus-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/actuator/health"]
+      interval: 60s
+      timeout: 15s
+      retries: 3
+      start_period: 180s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "5m"
+        max-file: "2"
+
+volumes:
+  postgres_data:
+  redis_data:
+
+networks:
+  fulus-network:
+    driver: bridge

@@ -1,0 +1,131 @@
+name: Deploy to AWS EC2
+
+on:
+  push:
+    branches:
+      - main
+      - production
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Deployment environment'
+        required: true
+        default: 'production'
+        type: choice
+        options:
+          - production
+          - free-tier
+          - development
+
+env:
+  EC2_USER: ubuntu
+  APP_DIR: /home/ubuntu/fulus-pay-ai-assistant
+
+jobs:
+  deploy:
+    name: Deploy to EC2
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.EC2_SSH_KEY }}" > ~/.ssh/deploy_key.pem
+          chmod 600 ~/.ssh/deploy_key.pem
+          ssh-keyscan -H ${{ secrets.EC2_HOST }} >> ~/.ssh/known_hosts
+
+      - name: Set deployment environment
+        id: set-env
+        run: |
+          if [ "${{ github.event.inputs.environment }}" != "" ]; then
+            echo "DEPLOY_ENV=${{ github.event.inputs.environment }}" >> $GITHUB_OUTPUT
+          elif [ "${{ github.ref }}" == "refs/heads/main" ]; then
+            echo "DEPLOY_ENV=free-tier" >> $GITHUB_OUTPUT
+          else
+            echo "DEPLOY_ENV=production" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Deploy to EC2
+        env:
+          DEPLOY_ENV: ${{ steps.set-env.outputs.DEPLOY_ENV }}
+        run: |
+          ssh -i ~/.ssh/deploy_key.pem ${{ env.EC2_USER }}@${{ secrets.EC2_HOST }} << 'ENDSSH'
+            set -e
+
+            # Navigate to app directory
+            cd ${{ env.APP_DIR }}
+
+            echo "Pulling latest changes..."
+            git pull origin ${{ github.ref_name }}
+
+            # Determine docker-compose file
+            if [ "${{ env.DEPLOY_ENV }}" = "free-tier" ]; then
+              COMPOSE_FILE="docker-compose.free-tier.yml"
+            elif [ "${{ env.DEPLOY_ENV }}" = "production" ]; then
+              COMPOSE_FILE="docker-compose.prod.yml"
+            else
+              COMPOSE_FILE="docker-compose.yml"
+            fi
+
+            echo "Using compose file: $COMPOSE_FILE"
+
+            # Stop existing containers
+            echo "Stopping existing containers..."
+            docker-compose -f $COMPOSE_FILE down || true
+
+            # Build new images
+            echo "Building Docker images..."
+            docker-compose -f $COMPOSE_FILE build --no-cache
+
+            # Start containers
+            echo "Starting containers..."
+            docker-compose -f $COMPOSE_FILE up -d
+
+            # Clean up
+            echo "Cleaning up unused Docker resources..."
+            docker system prune -f
+
+            echo "Deployment completed!"
+
+            # Show status
+            docker-compose -f $COMPOSE_FILE ps
+          ENDSSH
+
+      - name: Health Check
+        run: |
+          echo "Waiting for application to be healthy..."
+          TIMEOUT=300
+          ELAPSED=0
+          INTERVAL=10
+
+          while [ $ELAPSED -lt $TIMEOUT ]; do
+            if ssh -i ~/.ssh/deploy_key.pem ${{ env.EC2_USER }}@${{ secrets.EC2_HOST }} \
+               "curl -f http://localhost:8080/actuator/health -s > /dev/null 2>&1"; then
+              echo "✅ Application is healthy!"
+              exit 0
+            fi
+
+            echo "Waiting... ($ELAPSED/$TIMEOUT seconds)"
+            sleep $INTERVAL
+            ELAPSED=$((ELAPSED + INTERVAL))
+          done
+
+          echo "❌ Health check failed after ${TIMEOUT}s"
+          exit 1
+
+      - name: Cleanup SSH key
+        if: always()
+        run: |
+          rm -f ~/.ssh/deploy_key.pem
+
+      - name: Deployment notification
+        if: always()
+        run: |
+          if [ "${{ job.status }}" == "success" ]; then
+            echo "🚀 Deployment to ${{ steps.set-env.outputs.DEPLOY_ENV }} succeeded!"
+          else
+            echo "❌ Deployment to ${{ steps.set-env.outputs.DEPLOY_ENV }} failed!"
+          fi

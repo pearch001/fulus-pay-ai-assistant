@@ -1,0 +1,49 @@
+# Git
+.git
+.gitignore
+
+# Environment
+.env
+.env.template
+.env.local
+
+# IDE
+.idea
+.vscode
+*.iml
+*.iws
+*.ipr
+
+# Maven
+target/
+!target/*.jar
+pom.xml.tag
+pom.xml.releaseBackup
+pom.xml.versionsBackup
+pom.xml.next
+release.properties
+
+# Logs
+logs/
+*.log
+
+# Audio files
+audio_uploads/
+audio_responses/
+
+# Documentation
+*.md
+docs/
+
+# Docker
+Dockerfile
+docker-compose.yml
+.dockerignore
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Testing
+coverage/
+.coverage
