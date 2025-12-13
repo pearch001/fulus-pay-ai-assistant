@@ -41,9 +41,9 @@ git pull origin main
 nano .env
 
 # 5. Deploy with free tier configuration
-docker-compose -f docker-compose.free-tier.yml down
-docker-compose -f docker-compose.free-tier.yml build --no-cache
-docker-compose -f docker-compose.free-tier.yml up -d
+docker-compose -f docker-compose.yml down
+docker-compose -f docker-compose.yml build --no-cache
+docker-compose -f docker-compos.yml up -d
 
 # 6. Monitor startup (takes 3-5 minutes)
 docker-compose -f docker-compose.free-tier.yml logs -f

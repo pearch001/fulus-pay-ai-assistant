@@ -39,11 +39,11 @@ public class OpenApiConfig {
                                 .url("https://www.apache.org/licenses/LICENSE-2.0.html")))
                 .servers(List.of(
                         new Server()
-                                .url("http://localhost:8080")
-                                .description("Development Server"),
+                        .url("http://44.221.46.51:8080")
+                        .description("Staging Server"),
                         new Server()
-                                .url("http://44.221.46.51:8080")
-                                .description("Staging Server")))
+                                .url("http://localhost:8080")
+                                .description("Development Server")))
                 .addSecurityItem(new SecurityRequirement().addList("Bearer Authentication"))
                 .components(new Components()
                         .addSecuritySchemes("Bearer Authentication",
