@@ -42,8 +42,8 @@ public class OpenApiConfig {
                                 .url("http://localhost:8080")
                                 .description("Development Server"),
                         new Server()
-                                .url("https://api.fuluspay.com")
-                                .description("Production Server")))
+                                .url("http://44.221.46.51:8080")
+                                .description("Staging Server")))
                 .addSecurityItem(new SecurityRequirement().addList("Bearer Authentication"))
                 .components(new Components()
                         .addSecuritySchemes("Bearer Authentication",
