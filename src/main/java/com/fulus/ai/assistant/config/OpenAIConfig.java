@@ -70,7 +70,9 @@ public class OpenAIConfig {
      * Configure OpenAI Chat Model with options and function callbacks
      */
     @Bean
-    public ChatModel openAiChatModel(
+    @org.springframework.context.annotation.Primary
+    @org.springframework.beans.factory.annotation.Qualifier("openAiChatModel")
+    public OpenAiChatModel openAiChatModel(
             OpenAiApi openAiApi,
             TransactionQueryFunction transactionQueryFunction,
             StatementGeneratorFunction statementGeneratorFunction,
@@ -182,7 +184,8 @@ public class OpenAIConfig {
      * Configure ChatClient for easy interaction with OpenAI with function calling
      */
     @Bean
-    public ChatClient chatClient(ChatModel chatModel) {
+    @org.springframework.beans.factory.annotation.Qualifier("userChatClient")
+    public ChatClient chatClient(@org.springframework.beans.factory.annotation.Qualifier("openAiChatModel") ChatModel chatModel) {
         log.info("Configuring ChatClient with OpenAI ChatModel and function calling support");
 
         return ChatClient.builder(chatModel)

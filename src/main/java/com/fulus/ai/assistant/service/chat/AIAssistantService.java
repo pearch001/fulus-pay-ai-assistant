@@ -18,12 +18,18 @@ import java.util.List;
 import java.util.UUID;
 
 @Service
-@RequiredArgsConstructor
 @Slf4j
 public class AIAssistantService {
 
     private final ChatClient chatClient;
     private final PostgreSQLChatMemoryProvider memoryProvider;
+
+    public AIAssistantService(
+            @org.springframework.beans.factory.annotation.Qualifier("userChatClient") ChatClient chatClient,
+            PostgreSQLChatMemoryProvider memoryProvider) {
+        this.chatClient = chatClient;
+        this.memoryProvider = memoryProvider;
+    }
 
     /**
      * Send a message to AI assistant with conversation memory and function calling support

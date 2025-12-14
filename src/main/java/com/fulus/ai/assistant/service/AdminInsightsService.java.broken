@@ -1,0 +1,1945 @@
+package com.fulus.ai.assistant.service;
+
+import com.fulus.ai.assistant.dto.AdminChatRequest;
+import com.fulus.ai.assistant.dto.AdminChatResponse;
+import com.fulus.ai.assistant.entity.AdminChatMessage;
+import com.fulus.ai.assistant.entity.AdminConversation;
+import com.fulus.ai.assistant.entity.User;
+import com.fulus.ai.assistant.enums.InsightCategory;
+import com.fulus.ai.assistant.enums.InsightCategory;
+import com.fulus.ai.assistant.enums.MessageType;
+import com.fulus.ai.assistant.exception.UnauthorizedException;
+import com.fulus.ai.assistant.repository.AdminChatMessageRepository;
+import com.fulus.ai.assistant.repository.AdminConversationRepository;
+import com.fulus.ai.assistant.repository.UserRepository;
+import jakarta.annotation.PostConstruct;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.ai.chat.client.ChatClient;
+import org.springframework.ai.chat.messages.SystemMessage;
+import org.springframework.ai.chat.messages.UserMessage;
+import org.springframework.ai.chat.prompt.Prompt;
+import org.springframework.beans.factory.annotation.Qualifier;
+import org.springframework.core.io.ClassPathResource;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+import org.springframework.util.StreamUtils;
+
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.time.LocalDateTime;
+import java.time.format.DateTimeFormatter;
+import java.util.*;
+
+/**
+ * Admin Business Insights Service
+ *
+ * Provides AI-powered business intelligence for SyncPay executives and investors.
+ * Analyzes platform metrics, generates insights, and provides actionable recommendations.
+ *
+ * Features:
+ * - Conversation management for admin chat sessions
+ * - Business-focused AI responses using custom system prompts
+ * - Synthetic data generation for demo purposes
+ * - Conversation history tracking
+ * - Token usage monitoring
+ */
+@Service
+@Slf4j
+public class AdminInsightsService {
+
+    private final AdminConversationRepository conversationRepository;
+    private final AdminChatMessageRepository chatMessageRepository;
+    private final ChatClient chatClient;
+    private final UserRepository userRepository;
+    private final AdminInsightsCacheService cacheService;
+
+    private static final String SYSTEM_PROMPT_FILE = "admin-insights-system-prompt.txt";
+    private static final DateTimeFormatter DATE_FORMATTER = DateTimeFormatter.ofPattern("EEEE, MMMM d, yyyy");
+    private static final int MAX_HISTORY_MESSAGES = 10;
+    private static final int ESTIMATED_CHARS_PER_TOKEN = 4;
+    private static final long STATS_CACHE_DURATION_MINUTES = 5;
+
+    // System prompt template loaded from file
+    private String systemPromptTemplate;
+
+    // Cached platform statistics
+    private Map<String, Object> cachedPlatformStats;
+    private LocalDateTime statsCacheTimestamp;
+
+    // Constructor injection with @Qualifier for admin chat client
+    public AdminInsightsService(
+            AdminConversationRepository conversationRepository,
+            AdminChatMessageRepository chatMessageRepository,
+            @Qualifier("adminChatClient") ChatClient chatClient,
+            UserRepository userRepository,
+            AdminInsightsCacheService cacheService) {
+        this.conversationRepository = conversationRepository;
+        this.chatMessageRepository = chatMessageRepository;
+        this.chatClient = chatClient;
+        this.userRepository = userRepository;
+        this.cacheService = cacheService;
+    }
+
+    /**
+     * Load admin insights system prompt from file on service initialization
+     */
+    @PostConstruct
+    public void loadSystemPrompt() {
+        try {
+            ClassPathResource resource = new ClassPathResource(SYSTEM_PROMPT_FILE);
+            systemPromptTemplate = StreamUtils.copyToString(
+                    resource.getInputStream(),
+                    StandardCharsets.UTF_8
+            );
+            log.info("Admin insights system prompt loaded successfully. Length: {} characters",
+                    systemPromptTemplate.length());
+        } catch (IOException e) {
+            log.error("Failed to load system prompt from {}", SYSTEM_PROMPT_FILE, e);
+            // Fallback to basic prompt
+            systemPromptTemplate = "You are the Business Insights AI for SyncPay. " +
+                    "Provide actionable business intelligence to executives and investors.";
+            log.warn("Using fallback system prompt due to load failure");
+        }
+    }
+
+    /**
+     * Process an admin chat message and generate AI response
+     *
+     * @param request The chat request containing message and optional conversation ID
+     * @param adminId The UUID of the admin making the request
+     * @return AdminChatResponse with AI-generated insights
+     */
+    @Transactional
+    public AdminChatResponse processMessage(AdminChatRequest request, UUID adminId) {
+        long startTime = System.currentTimeMillis();
+        log.info("Processing admin chat message for admin: {}", adminId);
+
+        try {
+            // 1. Validate request
+            if (request.getMessage() == null || request.getMessage().trim().isEmpty()) {
+                throw new IllegalArgumentException("Message cannot be empty");
+            }
+
+            // 2. Get or create conversation
+            AdminConversation conversation = createOrGetConversation(adminId, request.getConversationId());
+            log.debug("Using conversation: {}", conversation.getConversationId());
+
+            // 2.5. Categorize the query for context and tracking
+            InsightCategory category = categorizeQuery(request.getMessage());
+            log.info("Query categorized as: {} - {}", category.name(), category.getDisplayName());
+
+            // 3. Save user message with category in metadata
+            int userMessageTokens = calculateTokens(request.getMessage());
+            AdminChatMessage userMessage = saveMessage(
+                    conversation.getConversationId(),
+                    MessageType.USER.name(),
+                    request.getMessage(),
+                    userMessageTokens
+            );
+
+            // Add category to message metadata
+            if (userMessage.getMetadata() == null) {
+                userMessage.setMetadata(new HashMap<>());
+            }
+            userMessage.getMetadata().put("category", category.name());
+            userMessage.getMetadata().put("categoryDisplay", category.getDisplayName());
+            chatMessageRepository.save(userMessage);
+
+            log.debug("Saved user message with {} tokens (sequence: {}, category: {})",
+                    userMessageTokens, userMessage.getSequenceNumber(), category.getDisplayName());
+
+            // 4. Check cache first if query should be cached
+            String cacheKey = null;
+            String aiResponse = null;
+
+            if (cacheService.shouldCache(request.getMessage())) {
+                cacheKey = cacheService.generateCacheKey(request.getMessage(), statsCacheTimestamp);
+                aiResponse = cacheService.getCachedResponse(cacheKey);
+
+                if (aiResponse != null) {
+                    cacheService.recordCacheHit();
+                    log.info("Cache HIT for query: '{}' (key: {})",
+                            request.getMessage().substring(0, Math.min(50, request.getMessage().length())), cacheKey);
+                } else {
+                    cacheService.recordCacheMiss();
+                    log.info("Cache MISS for query: '{}'",
+                            request.getMessage().substring(0, Math.min(50, request.getMessage().length())));
+                }
+            }
+
+            // 5. If not in cache, generate response
+            if (aiResponse == null) {
+                // Build optimized contextual messages with category-specific context
+                List<org.springframework.ai.chat.messages.Message> contextualMessages =
+                        buildContextualMessages(conversation.getConversationId(), request.getMessage(), adminId, category);
+                log.debug("Built {} contextual messages for AI", contextualMessages.size());
+
+                // Call OpenAI API with optimized context
+                cacheService.recordApiCall();
+                aiResponse = callOpenAIWithContext(contextualMessages);
+                log.info("Received AI response from OpenAI (length: {} chars)", aiResponse.length());
+
+                // Cache the response if we have a cache key
+                if (cacheKey != null) {
+                    cacheService.cacheResponse(cacheKey, aiResponse);
+                    log.debug("Cached response for future requests");
+                }
+            }
+
+            // 6. Save assistant response
+            int aiMessageTokens = calculateTokens(aiResponse);
+            long processingTime = System.currentTimeMillis() - startTime;
+
+            AdminChatMessage assistantMessage = saveMessage(
+                    conversation.getConversationId(),
+                    MessageType.ASSISTANT.name(),
+                    aiResponse,
+                    aiMessageTokens
+            );
+            );
+
+            // Update processing time
+            assistantMessage.setProcessingTimeMs(processingTime);
+            chatMessageRepository.save(assistantMessage);
+
+            log.debug("Saved AI response with {} tokens (sequence: {}, processing: {}ms)",
+                    aiMessageTokens, assistantMessage.getSequenceNumber(), processingTime);
+
+            // 7. Conversation stats already updated by saveMessage() calls above
+            log.debug("Conversation stats updated: messageCount={}, totalTokens tracked",
+                    userMessageTokens + aiMessageTokens);
+
+            // 7.5. Check if conversation needs auto-summarization (every 10 messages)
+            if (conversation.getMessageCount() % 10 == 0 && conversation.getMessageCount() >= 10) {
+                log.info("Triggering auto-summarization for conversation {} (message count: {})",
+                        conversation.getConversationId(), conversation.getMessageCount());
+                try {
+                    String summary = generateConversationSummary(conversation.getConversationId());
+                    if (summary != null) {
+                        conversation.setConversationSummary(summary);
+                        conversationRepository.save(conversation);
+                        log.info("Conversation summary generated and saved");
+                    }
+                } catch (Exception e) {
+                    log.error("Failed to generate conversation summary", e);
+                    // Don't fail the whole request if summarization fails
+                }
+            }
+
+            // 8. Build and return response
+            AdminChatResponse response = AdminChatResponse.builder()
+                    .message(aiResponse)
+                    .conversationId(conversation.getConversationId())
+                    .timestamp(LocalDateTime.now())
+                    .processingTimeMs(processingTime)
+                    .sequenceNumber(assistantMessage.getSequenceNumber())
+                    .tokenCount(aiMessageTokens)
+                    .charts(new ArrayList<>()) // TODO: Implement chart generation based on AI response
+                    .build();
+
+            log.info("Successfully processed message for admin: {} (processing time: {}ms)",
+                    adminId, processingTime);
+
+            return response;
+
+        } catch (IllegalArgumentException e) {
+            // Validation errors - return to user
+            log.warn("Validation error processing message for admin {}: {}", adminId, e.getMessage());
+            return buildErrorResponse(e.getMessage(), System.currentTimeMillis() - startTime);
+
+        } catch (UnauthorizedException e) {
+            // Security errors - return to user
+            log.error("Unauthorized access attempt by admin {}: {}", adminId, e.getMessage());
+            return buildErrorResponse("You do not have permission to access this conversation.",
+                    System.currentTimeMillis() - startTime);
+
+        } catch (Exception e) {
+            // Internal errors - log details but return generic message
+            log.error("Error processing admin chat message for admin: {}", adminId, e);
+            return buildErrorResponse(
+                    "We encountered an error processing your request. Please try again.",
+                    System.currentTimeMillis() - startTime
+            );
+        }
+    }
+
+    /**
+     * Create a new conversation or retrieve existing one
+     *
+     * @param adminId Admin user ID
+     * @param conversationId Optional conversation ID to continue existing conversation
+     * @return AdminConversation entity
+     * @throws UnauthorizedException if conversation belongs to different admin
+     */
+    @Transactional
+    public AdminConversation createOrGetConversation(UUID adminId, UUID conversationId) {
+        // 1. If conversationId provided, try to find and validate existing conversation
+        if (conversationId != null) {
+            Optional<AdminConversation> existingOpt = conversationRepository.findByConversationId(conversationId);
+
+            if (existingOpt.isPresent()) {
+                AdminConversation existing = existingOpt.get();
+
+                // Validate conversation belongs to this admin
+                if (!existing.getAdminId().equals(adminId)) {
+                    log.error("Admin {} attempted to access conversation {} belonging to admin {}",
+                            adminId, conversationId, existing.getAdminId());
+                    throw new UnauthorizedException(
+                            String.format("Conversation %s does not belong to admin %s", conversationId, adminId)
+                    );
+                }
+
+                // Check if conversation is active
+                if (!existing.getIsActive()) {
+                    log.info("Reactivating inactive conversation: {} for admin: {}", conversationId, adminId);
+                    // Reactivate the conversation
+                    existing.setIsActive(true);
+                }
+
+                // Update lastUpdated timestamp
+                existing.setUpdatedAt(LocalDateTime.now());
+                AdminConversation updated = conversationRepository.save(existing);
+
+                log.debug("Found and updated existing conversation: {} for admin: {}", conversationId, adminId);
+                return updated;
+            }
+
+            // Conversation ID provided but not found - log warning and create new
+            log.warn("Conversation {} not found, creating new conversation for admin: {}", conversationId, adminId);
+        }
+
+        // 2. Create new conversation (either conversationId is null or not found)
+        AdminConversation conversation = new AdminConversation();
+        conversation.setAdminId(adminId);
+        conversation.setConversationId(UUID.randomUUID()); // Generate new UUID
+        conversation.setIsActive(true);
+        conversation.setMessageCount(0);
+        conversation.setTotalTokens(0L);
+        conversation.setSubject("Business Insights Chat"); // TODO: Generate from first message
+        conversation.setCreatedAt(LocalDateTime.now());
+        conversation.setUpdatedAt(LocalDateTime.now());
+
+        AdminConversation saved = conversationRepository.save(conversation);
+        log.info("Created new admin conversation: {} for admin: {}", saved.getConversationId(), adminId);
+
+        return saved;
+    }
+
+    /**
+     * Get conversation history with limit
+     *
+     * Fetches the most recent N messages from a conversation and returns them
+     * in chronological order (oldest first) for proper context building.
+     *
+     * @param conversationId The conversation ID
+     * @param limit Maximum number of messages to retrieve (default: 20)
+     * @return List of AdminChatMessage entities in ascending order (oldest first)
+     */
+    public List<AdminChatMessage> getConversationHistory(UUID conversationId, int limit) {
+        // Validate limit
+        if (limit <= 0) {
+            log.warn("Invalid limit {} provided, using default of 20", limit);
+            limit = 20;
+        }
+
+        log.debug("Fetching conversation history for: {} with limit: {}", conversationId, limit);
+
+        // Fetch messages ordered by sequence number ascending
+        List<AdminChatMessage> messages = chatMessageRepository
+                .findByConversationIdOrderBySequenceNumberAsc(conversationId);
+
+        // If we have more messages than the limit, take only the most recent N
+        if (messages.size() > limit) {
+            // Take last N messages (most recent)
+            int startIndex = messages.size() - limit;
+            messages = messages.subList(startIndex, messages.size());
+            log.debug("Trimmed conversation history from {} to {} messages", messages.size() + startIndex, limit);
+        }
+
+        log.debug("Returning {} messages for conversation: {}", messages.size(), conversationId);
+        return messages; // Already in ascending order (oldest first)
+    }
+
+    /**
+     * Build system prompt with dynamic context
+     *
+     * @param adminId The admin user ID
+     * @return Customized system prompt string
+     */
+    public String buildSystemPrompt(UUID adminId) {
+        try {
+            // 1. Ensure prompt template is loaded (already done in @PostConstruct, but verify)
+            if (systemPromptTemplate == null || systemPromptTemplate.isEmpty()) {
+                log.warn("System prompt template is null or empty, reloading...");
+                loadSystemPrompt();
+            }
+
+            // 2. Get admin details from UserRepository
+            String adminName = userRepository.findById(adminId)
+                    .map(User::getName)
+                    .orElse("Admin");
+
+            // 3. Generate platform stats using generatePlatformStats()
+            Map<String, Object> platformStats = generatePlatformStats();
+
+            // 4. Replace placeholders
+            String currentDate = LocalDateTime.now().format(DATE_FORMATTER);
+            String formattedStats = formatPlatformStatsAsBulletPoints(platformStats);
+
+            String prompt = systemPromptTemplate
+                    .replace("{{CURRENT_DATE}}", currentDate)
+                    .replace("{{ADMIN_NAME}}", adminName)
+                    .replace("{{PLATFORM_STATS}}", formattedStats);
+
+            log.debug("Built system prompt for admin: {} (length: {} chars)", adminName, prompt.length());
+            return prompt;
+
+        } catch (Exception e) {
+            log.error("Error building system prompt for admin: {}", adminId, e);
+            // Return a minimal fallback prompt
+            return "You are the Business Insights AI for SyncPay. " +
+                    "Provide actionable business intelligence to executives and investors. " +
+                    "Current date: " + LocalDateTime.now().format(DATE_FORMATTER);
+        }
+    }
+
+    /**
+     * Generate synthetic platform statistics for demo purposes
+     * Stats are cached for 5 minutes to maintain consistency within conversations
+     *
+     * @return Map of platform metrics
+     */
+    public Map<String, Object> generatePlatformStats() {
+        // Check if cached stats are still valid
+        if (cachedPlatformStats != null && statsCacheTimestamp != null) {
+            long minutesSinceCache = java.time.Duration.between(statsCacheTimestamp, LocalDateTime.now()).toMinutes();
+            if (minutesSinceCache < STATS_CACHE_DURATION_MINUTES) {
+                log.debug("Returning cached platform stats (age: {} minutes)", minutesSinceCache);
+                return cachedPlatformStats;
+            }
+        }
+
+        // Generate new stats
+        log.info("Generating fresh synthetic platform statistics for demo");
+        Map<String, Object> stats = new LinkedHashMap<>();
+
+        // Use ThreadLocalRandom for realistic variance
+        java.util.concurrent.ThreadLocalRandom random = java.util.concurrent.ThreadLocalRandom.current();
+
+        // User metrics
+        int totalUsers = random.nextInt(15_000, 25_001);
+        int activeUsers = (int) (totalUsers * (random.nextDouble(0.65, 0.76))); // 65-75% of total
+        double monthlyGrowthRate = random.nextDouble(8.0, 15.1); // 8-15%
+
+        stats.put("totalUsers", totalUsers);
+        stats.put("activeUsers", activeUsers);
+        stats.put("activeUsersToday", (int) (activeUsers * random.nextDouble(0.25, 0.35))); // ~30% daily active
+        stats.put("activeUsersThisWeek", (int) (activeUsers * random.nextDouble(0.70, 0.85))); // ~80% weekly
+        stats.put("activeUsersThisMonth", activeUsers);
+        stats.put("newUsersToday", random.nextInt(50, 201)); // 50-200 new users daily
+        stats.put("newUsersThisMonth", (int) (totalUsers * monthlyGrowthRate / 100));
+        stats.put("monthlyGrowthRate", Math.round(monthlyGrowthRate * 10.0) / 10.0); // 1 decimal place
+
+        // Transaction metrics
+        int totalTransactions = random.nextInt(100_000, 500_001);
+        double successRate = random.nextDouble(92.0, 97.1); // 92-97%
+        long averageTransactionValue = random.nextLong(2_500, 8_001); // ₦2,500 - ₦8,000
+        long transactionVolume = totalTransactions * averageTransactionValue; // ₦50M - ₦200M range
+
+        stats.put("totalTransactions", totalTransactions);
+        stats.put("transactionsToday", random.nextInt(3_000, 15_001));
+        stats.put("transactionsThisMonth", totalTransactions);
+        stats.put("transactionSuccessRate", Math.round(successRate * 10.0) / 10.0);
+        stats.put("averageTransactionValue", averageTransactionValue);
+        stats.put("transactionVolume", String.format("₦%,d", transactionVolume));
+        stats.put("transactionVolumeRaw", transactionVolume);
+
+        // Revenue metrics
+        long cardRevenue = random.nextLong(500_000, 2_000_001); // ₦500K - ₦2M
+        long mrr = random.nextLong(3_000_000, 8_000_001); // ₦3M - ₦8M
+        long monthlyRevenue = mrr;
+        long lastMonthRevenue = (long) (monthlyRevenue / (1 + random.nextDouble(0.05, 0.20))); // 5-20% growth
+        double mrrGrowth = ((double) (monthlyRevenue - lastMonthRevenue) / lastMonthRevenue) * 100;
+
+        stats.put("cardTransactionFeeRevenue", String.format("₦%,d", cardRevenue));
+        stats.put("monthlyRecurringRevenue", String.format("₦%,d", mrr));
+        stats.put("revenueToday", String.format("₦%,d", random.nextLong(80_000, 250_001)));
+        stats.put("revenueThisMonth", String.format("₦%,d", monthlyRevenue));
+        stats.put("revenueLastMonth", String.format("₦%,d", lastMonthRevenue));
+        stats.put("monthOverMonthGrowth", Math.round(mrrGrowth * 10.0) / 10.0);
+
+        // Customer economics
+        long cac = random.nextLong(1_200, 2_501); // ₦1,200 - ₦2,500
+        long ltv = random.nextLong(15_000, 45_001); // ₦15,000 - ₦45,000
+        double ltvCacRatio = (double) ltv / cac;
+
+        stats.put("customerAcquisitionCost", String.format("₦%,d", cac));
+        stats.put("lifetimeValue", String.format("₦%,d", ltv));
+        stats.put("ltvToCacRatio", Math.round(ltvCacRatio * 10.0) / 10.0);
+
+        // Feature usage percentages
+        stats.put("offlineTransactionPercentage", Math.round(random.nextDouble(15.0, 25.1) * 10.0) / 10.0);
+        stats.put("cardTransactionPercentage", Math.round(random.nextDouble(30.0, 40.1) * 10.0) / 10.0);
+        stats.put("billPaymentPercentage", Math.round(random.nextDouble(25.0, 35.1) * 10.0) / 10.0);
+        stats.put("p2pTransferPercentage", Math.round(random.nextDouble(35.0, 45.1) * 10.0) / 10.0);
+
+        // Performance metrics
+        stats.put("peakHours", "2PM - 6PM WAT");
+        stats.put("averageResponseTime", String.format("%.1fs", random.nextDouble(0.8, 2.0)));
+        stats.put("uptime", String.format("%.2f%%", random.nextDouble(99.5, 99.99)));
+
+        // Top categories
+        stats.put("topCategories", Arrays.asList("Airtime", "Bills", "P2P Transfers"));
+
+        // Geographic distribution (top Nigerian states)
+        Map<String, Integer> topStates = new LinkedHashMap<>();
+        topStates.put("Lagos", random.nextInt(8_000, 12_001));
+        topStates.put("Abuja", random.nextInt(4_000, 7_001));
+        topStates.put("Rivers", random.nextInt(2_000, 4_001));
+        topStates.put("Kano", random.nextInt(1_500, 3_001));
+        topStates.put("Oyo", random.nextInt(1_000, 2_501));
+        stats.put("topStatesByUsers", topStates);
+
+        // Timestamp for cache tracking
+        stats.put("generatedAt", LocalDateTime.now().toString());
+        stats.put("cacheExpiresAt", LocalDateTime.now().plusMinutes(STATS_CACHE_DURATION_MINUTES).toString());
+
+        // Cache the stats
+        cachedPlatformStats = stats;
+        statsCacheTimestamp = LocalDateTime.now();
+
+        log.info("Generated and cached new platform stats. Total Users: {}, Transactions: {}, Revenue: {}",
+                totalUsers, totalTransactions, stats.get("revenueThisMonth"));
+
+        return stats;
+    }
+
+    /**
+     * Save a chat message to the database and update conversation metadata
+     *
+     * @param conversationId The conversation ID
+     * @param role Message role (USER, ASSISTANT, SYSTEM)
+     * @param content Message content
+     * @param tokenCount Estimated token count (will be calculated if 0)
+     * @return Saved AdminChatMessage entity
+     */
+    @Transactional
+    public AdminChatMessage saveMessage(UUID conversationId, String role, String content, int tokenCount) {
+        // 1. Find conversation by conversationId
+        AdminConversation conversation = conversationRepository.findByConversationId(conversationId)
+                .orElseThrow(() -> new RuntimeException("Conversation not found: " + conversationId));
+
+        // 2. Get next sequence number
+        Integer maxSequence = chatMessageRepository.findMaxSequenceNumber(conversationId);
+        int nextSequence = (maxSequence != null ? maxSequence : 0) + 1;
+        log.debug("Next sequence number for conversation {}: {}", conversationId, nextSequence);
+
+        // Estimate tokens if not provided
+        int finalTokenCount = tokenCount > 0 ? tokenCount : calculateTokens(content);
+
+        // 3. Create AdminChatMessage
+        AdminChatMessage message = new AdminChatMessage();
+        message.setConversationId(conversationId);
+        message.setRole(MessageType.valueOf(role));
+        message.setContent(content);
+        message.setTokenCount(finalTokenCount);
+        message.setSequenceNumber(nextSequence);
+        message.setCreatedAt(LocalDateTime.now());
+        message.setMetadata(new HashMap<>()); // Empty metadata for now
+
+        // 4. Save message
+        AdminChatMessage saved = chatMessageRepository.save(message);
+        log.debug("Saved {} message (seq: {}, tokens: {}) for conversation: {}",
+                role, nextSequence, finalTokenCount, conversationId);
+
+        // 5. Update conversation metadata
+        conversation.setMessageCount(conversation.getMessageCount() + 1);
+        conversation.setTotalTokens(conversation.getTotalTokens() + finalTokenCount);
+        conversation.setUpdatedAt(LocalDateTime.now());
+        conversationRepository.save(conversation);
+        log.debug("Updated conversation {}: messageCount={}, totalTokens={}",
+                conversationId, conversation.getMessageCount(), conversation.getTotalTokens());
+
+        return saved;
+    }
+
+    /**
+     * Calculate estimated token count for a text string
+     * Simple approximation: ~4 characters per token
+     *
+     * @param content The text content
+    /**
+     * Build contextual messages with smart token optimization
+     *
+     * Implements intelligent context management:
+     * - Topic detection and switching
+     * - Token budget management (max 3000 tokens for context)
+     * - Message summarization for older content
+     * - Metadata hints for AI context
+     * - Category-specific context enhancement
+     *
+     * @param conversationId Conversation ID
+     * @param currentMessage Current user message
+     * @param adminId Admin user ID
+     * @param category Insight category for context specialization
+     * @return Optimized list of messages for ChatClient
+     */
+    private List<org.springframework.ai.chat.messages.Message> buildContextualMessages(
+            UUID conversationId, String currentMessage, UUID adminId, InsightCategory category) {
+
+        log.debug("Building contextual messages for conversation: {} (Category: {})",
+                conversationId, category.getDisplayName());
+
+        List<org.springframework.ai.chat.messages.Message> messages = new ArrayList<>();
+
+        // 1. Get recent messages (last 20)
+        List<AdminChatMessage> recentHistory = getConversationHistory(conversationId, 20);
+
+        // 2. Build system prompt with fresh stats and category-specific context
+        String systemPrompt = buildSystemPrompt(adminId);
+
+        // Add category-specific context to system prompt
+        String categoryContext = buildCategoryContext(category);
+        systemPrompt = systemPrompt + "\n\n" + categoryContext;
+
+        messages.add(new SystemMessage(systemPrompt));
+
+        int systemPromptTokens = calculateTokens(systemPrompt);
+        int currentMessageTokens = calculateTokens(currentMessage);
+        int totalTokens = systemPromptTokens + currentMessageTokens;
+
+        final int MAX_CONTEXT_TOKENS = 3000;
+        final int RESERVED_FOR_RESPONSE = 1500;
+        int availableTokens = MAX_CONTEXT_TOKENS - totalTokens;
+
+        log.debug("Token budget - System: {}, Current: {}, Available: {}/{}",
+                systemPromptTokens, currentMessageTokens, availableTokens, MAX_CONTEXT_TOKENS);
+
+        // 3. Analyze conversation for topic switches and context
+        ConversationContext context = analyzeConversation(recentHistory, currentMessage);
+
+        // 3.5. Add saved conversation summary if available (for long conversations)
+        AdminConversation conversation = conversationRepository.findByConversationId(conversationId).orElse(null);
+        if (conversation != null && conversation.getConversationSummary() != null &&
+            !conversation.getConversationSummary().isEmpty() && availableTokens > 200) {
+
+            String savedSummary = conversation.getConversationSummary();
+            int summaryTokens = calculateTokens(savedSummary);
+
+            if (summaryTokens < availableTokens) {
+                messages.add(new SystemMessage("Previous conversation summary: " + savedSummary));
+                totalTokens += summaryTokens;
+                availableTokens -= summaryTokens;
+                log.debug("Added saved conversation summary ({} tokens)", summaryTokens);
+            }
+        }
+        // 4. Add inline conversation summary if conversation is long and no saved summary
+        else if (recentHistory.size() > 10 && availableTokens > 200) {
+            String summary = generateConversationSummary(recentHistory, context);
+            if (summary != null && !summary.isEmpty()) {
+                int summaryTokens = calculateTokens(summary);
+                if (summaryTokens < availableTokens) {
+                    messages.add(new SystemMessage("Conversation context: " + summary));
+                    totalTokens += summaryTokens;
+                    availableTokens -= summaryTokens;
+                    log.debug("Added inline conversation summary ({} tokens)", summaryTokens);
+                }
+            }
+        }
+
+        // 5. Build optimized history based on available tokens
+        List<org.springframework.ai.chat.messages.Message> historyMessages =
+                buildOptimizedHistory(recentHistory, availableTokens, context);
+
+        messages.addAll(historyMessages);
+
+        // 6. Add current user message
+        messages.add(new UserMessage(currentMessage));
+
+        log.info("Built {} contextual messages (estimated {} total tokens)",
+                messages.size(), totalTokens);
+
+        return messages;
+    }
+
+    /**
+     * Analyze conversation for topic switches and context
+     */
+    private ConversationContext analyzeConversation(List<AdminChatMessage> history, String currentMessage) {
+        ConversationContext context = new ConversationContext();
+
+        // Extract topics from messages
+        List<String> topics = new ArrayList<>();
+        String lastDataPoint = null;
+
+        for (AdminChatMessage msg : history) {
+            String content = msg.getContent().toLowerCase();
+
+            // Detect topics
+            if (content.contains("revenue") || content.contains("mrr") || content.contains("₦")) {
+                if (!topics.contains("revenue")) topics.add("revenue");
+                // Extract last revenue mention
+                if (content.contains("₦")) {
+                    int start = content.indexOf("₦");
+                    int end = Math.min(start + 20, content.length());
+                    lastDataPoint = content.substring(start, end).split("[\\s,]")[0];
+                }
+            }
+            if (content.contains("user") || content.contains("growth") || content.contains("active")) {
+                if (!topics.contains("user growth")) topics.add("user growth");
+            }
+            if (content.contains("transaction") || content.contains("payment")) {
+                if (!topics.contains("transactions")) topics.add("transactions");
+            }
+            if (content.contains("retention") || content.contains("churn")) {
+                if (!topics.contains("retention")) topics.add("retention");
+            }
+        }
+
+        // Detect if current message is a follow-up
+        String currentLower = currentMessage.toLowerCase();
+        context.isFollowUp = currentLower.startsWith("what about") ||
+                             currentLower.startsWith("how about") ||
+                             currentLower.contains("also") ||
+                             currentLower.contains("and what") ||
+                             currentLower.startsWith("can you");
+
+        // Detect topic switch
+        boolean topicSwitch = false;
+        if (!topics.isEmpty()) {
+            boolean currentMatchesPreviousTopics = topics.stream()
+                    .anyMatch(topic -> currentLower.contains(topic));
+            topicSwitch = !currentMatchesPreviousTopics && !context.isFollowUp;
+        }
+
+        context.topics = topics;
+        context.lastDataPoint = lastDataPoint;
+        context.hasTopicSwitch = topicSwitch;
+
+        log.debug("Conversation analysis - Topics: {}, FollowUp: {}, TopicSwitch: {}, LastData: {}",
+                topics, context.isFollowUp, topicSwitch, lastDataPoint);
+
+        return context;
+    }
+
+    /**
+     * Generate conversation summary for context
+     */
+    private String generateConversationSummary(List<AdminChatMessage> history, ConversationContext context) {
+        StringBuilder summary = new StringBuilder();
+
+        if (!context.topics.isEmpty()) {
+            summary.append("Previous topics discussed: ").append(String.join(", ", context.topics)).append(". ");
+        }
+
+        if (context.lastDataPoint != null) {
+            summary.append("Last referenced data: ").append(context.lastDataPoint).append(". ");
+        }
+
+        // Add message count context
+        long userMessages = history.stream().filter(m -> m.getRole() == MessageType.USER).count();
+        summary.append("Total questions in conversation: ").append(userMessages).append(".");
+
+        return summary.toString();
+    }
+
+    /**
+     * Build optimized history with token budget management
+     */
+    private List<org.springframework.ai.chat.messages.Message> buildOptimizedHistory(
+            List<AdminChatMessage> history, int availableTokens, ConversationContext context) {
+
+        List<org.springframework.ai.chat.messages.Message> optimized = new ArrayList<>();
+
+        if (history.isEmpty() || availableTokens < 100) {
+            return optimized;
+        }
+
+        // Strategy: Keep last 5 messages fully, summarize or skip older ones
+        int recentCount = Math.min(5, history.size());
+        List<AdminChatMessage> recentMessages = history.subList(
+                Math.max(0, history.size() - recentCount), history.size());
+        List<AdminChatMessage> olderMessages = history.size() > recentCount ?
+                history.subList(0, history.size() - recentCount) : new ArrayList<>();
+
+        int usedTokens = 0;
+
+        // Add older messages (compressed if topic switched or token limit reached)
+        if (!olderMessages.isEmpty() && !context.hasTopicSwitch) {
+            for (AdminChatMessage msg : olderMessages) {
+                int msgTokens = calculateTokens(msg.getContent());
+
+                if (usedTokens + msgTokens < availableTokens * 0.4) { // Use max 40% for old messages
+                    // Add full message if budget allows
+                    optimized.add(createMessage(msg));
+                    usedTokens += msgTokens;
+                } else if (usedTokens < availableTokens * 0.3) {
+                    // Compress message to key points
+                    String compressed = compressMessage(msg.getContent());
+                    optimized.add(createMessage(msg.getRole(), compressed));
+                    usedTokens += calculateTokens(compressed);
+                } else {
+                    break; // Skip remaining old messages
+                }
+            }
+        }
+
+        // Add recent messages (always include these fully)
+        for (AdminChatMessage msg : recentMessages) {
+            int msgTokens = calculateTokens(msg.getContent());
+            if (usedTokens + msgTokens < availableTokens) {
+                optimized.add(createMessage(msg));
+                usedTokens += msgTokens;
+            } else {
+                // If we can't fit all recent messages, truncate
+                log.warn("Token budget exceeded, truncating recent history");
+                break;
+            }
+        }
+
+        log.debug("Optimized history: {} messages using {} tokens (budget: {})",
+                optimized.size(), usedTokens, availableTokens);
+
+        return optimized;
+    }
+
+    /**
+     * Compress message to key points for token efficiency
+     */
+    private String compressMessage(String content) {
+        if (content.length() <= 100) {
+            return content;
+        }
+
+        // Extract key elements: numbers, important words
+        String compressed = content;
+
+        // Keep numbers and currency
+        compressed = compressed.replaceAll("(?i)(what|how|can you|please|tell me|show me)", "");
+        compressed = compressed.replaceAll("\\s+", " ").trim();
+
+        // Truncate if still too long
+        if (compressed.length() > 150) {
+            compressed = compressed.substring(0, 147) + "...";
+        }
+
+        return compressed;
+    }
+
+    /**
+     * Create Spring AI message from AdminChatMessage
+     */
+    private org.springframework.ai.chat.messages.Message createMessage(AdminChatMessage msg) {
+        return createMessage(msg.getRole(), msg.getContent());
+    }
+
+    /**
+     * Create Spring AI message from role and content
+     */
+    private org.springframework.ai.chat.messages.Message createMessage(MessageType role, String content) {
+        if (role == MessageType.USER) {
+            return new UserMessage(content);
+        } else if (role == MessageType.ASSISTANT) {
+            return new org.springframework.ai.chat.messages.AssistantMessage(content);
+        } else {
+            return new SystemMessage(content);
+        }
+    }
+
+    /**
+     * Inner class to hold conversation context analysis
+     */
+    private static class ConversationContext {
+        List<String> topics = new ArrayList<>();
+        String lastDataPoint;
+        boolean isFollowUp;
+        boolean hasTopicSwitch;
+    }
+
+    /**
+     * Call OpenAI API with pre-built contextual messages
+     */
+    private String callOpenAIWithContext(List<org.springframework.ai.chat.messages.Message> messages) {
+        log.debug("Calling OpenAI with {} contextual messages", messages.size());
+
+        try {
+            // Create prompt with OpenAI options
+            org.springframework.ai.openai.OpenAiChatOptions options = org.springframework.ai.openai.OpenAiChatOptions.builder()
+                    .withModel("gpt-4-turbo")
+                    .withTemperature(0.7)
+                    .withMaxTokens(1500)
+                    .build();
+
+            Prompt prompt = new Prompt(messages, options);
+
+            // Call ChatClient
+            org.springframework.ai.chat.model.ChatResponse response = chatClient.prompt(prompt)
+                    .call()
+                    .chatResponse();
+
+            if (response == null || response.getResult() == null) {
+                log.warn("OpenAI returned null response");
+                return "I apologize, but I couldn't generate a response at this time. Please try rephrasing your question.";
+            }
+
+            // Extract AI response
+            String aiMessage = response.getResult().getOutput().getContent();
+
+            if (aiMessage == null || aiMessage.trim().isEmpty()) {
+                log.warn("OpenAI returned empty response content");
+                return "I apologize, but I couldn't generate a response at this time. Please try rephrasing your question.";
+            }
+
+            // Log token usage if available
+            if (response.getMetadata() != null && response.getMetadata().getUsage() != null) {
+                long totalTokens = response.getMetadata().getUsage().getTotalTokens();
+                log.info("OpenAI response generated - Tokens used: {}, Response length: {} chars",
+                        totalTokens, aiMessage.length());
+            } else {
+                log.info("OpenAI response generated successfully (length: {} chars)", aiMessage.length());
+            }
+
+            return aiMessage.trim();
+
+        } catch (Exception e) {
+            log.error("Error calling OpenAI API", e);
+            throw new RuntimeException("Failed to generate AI response: " + e.getMessage(), e);
+        }
+    }
+
+    /**
+     * Calculate estimated token count for a text string
+     * Simple approximation: ~4 characters per token
+     *
+     * @param content The text content
+     * @return Estimated token count
+     */
+    public int calculateTokens(String content) {
+        if (content == null || content.isEmpty()) {
+            return 0;
+        }
+        return Math.max(1, content.length() / ESTIMATED_CHARS_PER_TOKEN);
+    }
+
+    /**
+     * Build contextual messages with smart token optimization
+     *
+     * Implements intelligent context management:
+     * - Topic detection and switching
+     * - Token budget management (max 3000 tokens for context)
+     * - Message summarization for older content
+     * - Metadata hints for AI context
+     * - Category-specific context enhancement
+     *
+     * @param conversationId Conversation ID
+     * @param currentMessage Current user message
+     * @param adminId Admin user ID
+     * @param category Insight category for context specialization
+     * @return Optimized list of messages for ChatClient
+     */
+    private List<org.springframework.ai.chat.messages.Message> buildContextualMessages(
+            UUID conversationId, String currentMessage, UUID adminId, InsightCategory category) {
+
+        log.debug("Building contextual messages for conversation: {} (Category: {})",
+                conversationId, category.getDisplayName());
+
+        List<org.springframework.ai.chat.messages.Message> messages = new ArrayList<>();
+
+        // 1. Get recent messages (last 20)
+        List<AdminChatMessage> recentHistory = getConversationHistory(conversationId, 20);
+
+        // 2. Build system prompt with fresh stats and category-specific context
+        String systemPrompt = buildSystemPrompt(adminId);
+
+        // Add category-specific context to system prompt
+        String categoryContext = buildCategoryContext(category);
+        systemPrompt = systemPrompt + "\n\n" + categoryContext;
+
+        messages.add(new SystemMessage(systemPrompt));
+                    .build();
+        // Add category-specific context to system prompt
+            Prompt prompt = new Prompt(messages, options);
+
+            // 6. Call ChatClient
+            org.springframework.ai.chat.model.ChatResponse response = chatClient.prompt(prompt)
+
+                    .chatResponse();
+        int currentMessageTokens = calculateTokens(currentMessage);
+            if (response == null || response.getResult() == null) {
+                log.warn("OpenAI returned null response");
+        final int MAX_CONTEXT_TOKENS = 3000;
+        final int RESERVED_FOR_RESPONSE = 1500;
+        int availableTokens = MAX_CONTEXT_TOKENS - totalTokens;
+            // 7. Extract AI response
+            String aiMessage = response.getResult().getOutput().getContent();
+
+            if (aiMessage == null || aiMessage.trim().isEmpty()) {
+                log.warn("OpenAI returned empty response content");
+                return "I apologize, but I couldn't generate a response at this time. Please try rephrasing your question.";
+            }
+
+            // Log token usage if available
+            if (response.getMetadata() != null && response.getMetadata().getUsage() != null) {
+                long totalTokens = response.getMetadata().getUsage().getTotalTokens();
+                log.info("OpenAI response generated - Tokens used: {}, Response length: {} chars",
+                        totalTokens, aiMessage.length());
+            } else {
+                log.info("OpenAI response generated successfully (length: {} chars)", aiMessage.length());
+            }
+
+            return aiMessage.trim();
+                systemPromptTokens, currentMessageTokens, availableTokens, MAX_CONTEXT_TOKENS);
+
+        // 3. Analyze conversation for topic switches and context
+        ConversationContext context = analyzeConversation(recentHistory, currentMessage);
+
+        // 4. Add conversation summary if conversation is long
+        if (recentHistory.size() > 10 && availableTokens > 200) {
+            String summary = generateConversationSummary(recentHistory, context);
+            if (summary != null && !summary.isEmpty()) {
+                int summaryTokens = calculateTokens(summary);
+                if (summaryTokens < availableTokens) {
+                    messages.add(new SystemMessage("Conversation context: " + summary));
+                    totalTokens += summaryTokens;
+                    availableTokens -= summaryTokens;
+                    log.debug("Added conversation summary ({} tokens)", summaryTokens);
+                }
+            }
+        }
+
+        // 5. Build optimized history based on available tokens
+        List<org.springframework.ai.chat.messages.Message> historyMessages =
+                buildOptimizedHistory(recentHistory, availableTokens, context);
+
+        messages.addAll(historyMessages);
+
+        // 6. Add current user message
+        messages.add(new UserMessage(currentMessage));
+
+        log.info("Built {} contextual messages (estimated {} total tokens)",
+                messages.size(), totalTokens);
+
+        return messages;
+    }
+
+    /**
+     * Analyze conversation for topic switches and context
+     */
+    private ConversationContext analyzeConversation(List<AdminChatMessage> history, String currentMessage) {
+        ConversationContext context = new ConversationContext();
+
+        // Extract topics from messages
+        List<String> topics = new ArrayList<>();
+        String lastDataPoint = null;
+
+        for (AdminChatMessage msg : history) {
+            String content = msg.getContent().toLowerCase();
+
+            // Detect topics
+            if (content.contains("revenue") || content.contains("mrr") || content.contains("₦")) {
+                if (!topics.contains("revenue")) topics.add("revenue");
+                // Extract last revenue mention
+                if (content.contains("₦")) {
+                    int start = content.indexOf("₦");
+                    int end = Math.min(start + 20, content.length());
+                    lastDataPoint = content.substring(start, end).split("[\\s,]")[0];
+                }
+            }
+            if (content.contains("user") || content.contains("growth") || content.contains("active")) {
+                if (!topics.contains("user growth")) topics.add("user growth");
+            }
+            if (content.contains("transaction") || content.contains("payment")) {
+                if (!topics.contains("transactions")) topics.add("transactions");
+            }
+            if (content.contains("retention") || content.contains("churn")) {
+                if (!topics.contains("retention")) topics.add("retention");
+            }
+        }
+
+        // Detect if current message is a follow-up
+        String currentLower = currentMessage.toLowerCase();
+        context.isFollowUp = currentLower.startsWith("what about") ||
+                             currentLower.startsWith("how about") ||
+                             currentLower.contains("also") ||
+                             currentLower.contains("and what") ||
+                             currentLower.startsWith("can you");
+
+        // Detect topic switch
+        boolean topicSwitch = false;
+        if (!topics.isEmpty()) {
+            boolean currentMatchesPreviousTopics = topics.stream()
+                    .anyMatch(topic -> currentLower.contains(topic));
+            topicSwitch = !currentMatchesPreviousTopics && !context.isFollowUp;
+        }
+
+        context.topics = topics;
+        context.lastDataPoint = lastDataPoint;
+        context.hasTopicSwitch = topicSwitch;
+
+        log.debug("Conversation analysis - Topics: {}, FollowUp: {}, TopicSwitch: {}, LastData: {}",
+                topics, context.isFollowUp, topicSwitch, lastDataPoint);
+
+        return context;
+    }
+
+    /**
+     * Generate conversation summary for context
+     */
+    private String generateConversationSummary(List<AdminChatMessage> history, ConversationContext context) {
+        StringBuilder summary = new StringBuilder();
+
+        if (!context.topics.isEmpty()) {
+            summary.append("Previous topics discussed: ").append(String.join(", ", context.topics)).append(". ");
+        }
+
+        if (context.lastDataPoint != null) {
+            summary.append("Last referenced data: ").append(context.lastDataPoint).append(". ");
+        }
+
+        // Add message count context
+        long userMessages = history.stream().filter(m -> m.getRole() == MessageType.USER).count();
+        summary.append("Total questions in conversation: ").append(userMessages).append(".");
+
+        return summary.toString();
+    }
+
+    /**
+     * Build optimized history with token budget management
+     */
+    private List<org.springframework.ai.chat.messages.Message> buildOptimizedHistory(
+            List<AdminChatMessage> history, int availableTokens, ConversationContext context) {
+
+        List<org.springframework.ai.chat.messages.Message> optimized = new ArrayList<>();
+
+        if (history.isEmpty() || availableTokens < 100) {
+
+    /**
+     * Categorize admin query into insight categories
+     *
+     * Analyzes the message content to determine what type of business insight
+     * is being requested. Used for context enhancement and analytics tracking.
+     *
+     * @param message The user's query message
+     * @return InsightCategory enum value
+     */
+    private InsightCategory categorizeQuery(String message) {
+        if (message == null || message.trim().isEmpty()) {
+            return InsightCategory.GENERAL_QUERY;
+        }
+
+        String lower = message.toLowerCase();
+
+        // Revenue analysis keywords
+        if (lower.contains("revenue") || lower.contains("income") || lower.contains("earnings") ||
+            lower.contains("mrr") || lower.contains("arr") || lower.contains("profit") ||
+            lower.contains("sales") || lower.contains("₦")) {
+            return InsightCategory.REVENUE_ANALYSIS;
+        }
+
+        // User growth keywords
+        if (lower.contains("user") || lower.contains("customer") || lower.contains("growth") ||
+            lower.contains("acquisition") || lower.contains("retention") || lower.contains("churn") ||
+            lower.contains("active") || lower.contains("signup")) {
+            return InsightCategory.USER_GROWTH;
+        }
+
+        // Transaction patterns keywords
+        if (lower.contains("transaction") || lower.contains("payment") || lower.contains("volume") ||
+            lower.contains("transfer") || lower.contains("success rate") || lower.contains("failure") ||
+            lower.contains("processed")) {
+            return InsightCategory.TRANSACTION_PATTERNS;
+        }
+
+        // Fee optimization keywords
+        if (lower.contains("fee") || lower.contains("pricing") || lower.contains("cost") ||
+            lower.contains("commission") || lower.contains("charge") || lower.contains("rate")) {
+            return InsightCategory.FEE_OPTIMIZATION;
+        }
+
+        // Risk assessment keywords
+        if (lower.contains("risk") || lower.contains("fraud") || lower.contains("security") ||
+            lower.contains("suspicious") || lower.contains("anomal") || lower.contains("threat")) {
+            return InsightCategory.RISK_ASSESSMENT;
+        }
+
+        // Market intelligence keywords
+        if (lower.contains("market") || lower.contains("competitor") || lower.contains("industry") ||
+            lower.contains("trend") || lower.contains("benchmark") || lower.contains("position")) {
+            return InsightCategory.MARKET_INTELLIGENCE;
+        }
+
+        // Default to general query
+        return InsightCategory.GENERAL_QUERY;
+    }
+
+    /**
+     * Build category-specific context for AI prompt
+     *
+     * Adds specialized context based on the query category to help the AI
+     * provide more focused and relevant insights.
+     *
+     * @param category The insight category
+     * @return Category-specific context string
+     */
+    private String buildCategoryContext(InsightCategory category) {
+        StringBuilder context = new StringBuilder();
+        context.append("**Current Query Category: ").append(category.getDisplayName()).append("**\n");
+        context.append(category.getDescription()).append("\n\n");
+
+        switch (category) {
+            case REVENUE_ANALYSIS:
+                context.append("Focus Areas:\n");
+                context.append("- Monthly Recurring Revenue (MRR) trends\n");
+                context.append("- Revenue growth rate and projections\n");
+                context.append("- Revenue breakdown by source (fees, subscriptions, etc.)\n");
+                context.append("- Average revenue per user (ARPU)\n");
+                context.append("- Revenue optimization opportunities\n\n");
+                context.append("Suggested Insights: Compare current vs. previous periods, identify top revenue sources, forecast future revenue.");
+                break;
+
+            case USER_GROWTH:
+                context.append("Focus Areas:\n");
+                context.append("- New user acquisition rate\n");
+                context.append("- Active user metrics (DAU, MAU)\n");
+                context.append("- User retention and churn rates\n");
+                context.append("- Customer lifetime value (LTV)\n");
+                context.append("- Growth drivers and obstacles\n\n");
+                context.append("Suggested Insights: Analyze growth trends, identify retention issues, recommend acquisition strategies.");
+                break;
+
+            case TRANSACTION_PATTERNS:
+                context.append("Focus Areas:\n");
+                context.append("- Transaction volume trends\n");
+                context.append("- Success vs. failure rates\n");
+                context.append("- Peak transaction times\n");
+                context.append("- Transaction categories breakdown\n");
+                context.append("- Average transaction value\n\n");
+                context.append("Suggested Insights: Identify patterns, detect anomalies, optimize processing times.");
+                break;
+
+            case FEE_OPTIMIZATION:
+                context.append("Focus Areas:\n");
+                context.append("- Current fee structure analysis\n");
+                context.append("- Fee revenue vs. costs\n");
+                context.append("- Competitive pricing comparison\n");
+                context.append("- Price elasticity and impact\n");
+                context.append("- Optimization recommendations\n\n");
+                context.append("Suggested Insights: Compare with market rates, suggest pricing adjustments, maximize revenue.");
+                break;
+
+            case RISK_ASSESSMENT:
+                context.append("Focus Areas:\n");
+                context.append("- Fraud detection patterns\n");
+                context.append("- Failed transaction analysis\n");
+                context.append("- Security incidents and trends\n");
+                context.append("- Risk exposure levels\n");
+                context.append("- Mitigation strategies\n\n");
+                context.append("Suggested Insights: Identify high-risk activities, recommend security improvements.");
+                break;
+
+            case MARKET_INTELLIGENCE:
+                context.append("Focus Areas:\n");
+                context.append("- Market positioning and share\n");
+                context.append("- Competitive landscape\n");
+                context.append("- Industry trends in Nigerian fintech\n");
+                context.append("- Growth opportunities\n");
+                context.append("- Strategic recommendations\n\n");
+                context.append("Suggested Insights: Analyze market trends, identify competitive advantages.");
+                break;
+
+            case GENERAL_QUERY:
+            default:
+                context.append("Provide comprehensive business insights based on available platform data.\n");
+                context.append("Focus on actionable recommendations and data-driven analysis.");
+                break;
+        }
+
+        return context.toString();
+    }
+            return optimized;
+        }
+
+        // Strategy: Keep last 5 messages fully, summarize or skip older ones
+        int recentCount = Math.min(5, history.size());
+        List<AdminChatMessage> recentMessages = history.subList(
+                Math.max(0, history.size() - recentCount), history.size());
+        List<AdminChatMessage> olderMessages = history.size() > recentCount ?
+                history.subList(0, history.size() - recentCount) : new ArrayList<>();
+
+        int usedTokens = 0;
+
+        // Add older messages (compressed if topic switched or token limit reached)
+        if (!olderMessages.isEmpty() && !context.hasTopicSwitch) {
+            for (AdminChatMessage msg : olderMessages) {
+                int msgTokens = calculateTokens(msg.getContent());
+
+                if (usedTokens + msgTokens < availableTokens * 0.4) { // Use max 40% for old messages
+                    // Add full message if budget allows
+                    optimized.add(createMessage(msg));
+                    usedTokens += msgTokens;
+                } else if (usedTokens < availableTokens * 0.3) {
+                    // Compress message to key points
+                    String compressed = compressMessage(msg.getContent());
+                    optimized.add(createMessage(msg.getRole(), compressed));
+                    usedTokens += calculateTokens(compressed);
+                } else {
+                    break; // Skip remaining old messages
+                }
+            }
+        }
+
+        // Add recent messages (always include these fully)
+        for (AdminChatMessage msg : recentMessages) {
+            int msgTokens = calculateTokens(msg.getContent());
+            if (usedTokens + msgTokens < availableTokens) {
+                optimized.add(createMessage(msg));
+                usedTokens += msgTokens;
+            } else {
+                // If we can't fit all recent messages, truncate
+                log.warn("Token budget exceeded, truncating recent history");
+                break;
+            }
+        }
+
+        log.debug("Optimized history: {} messages using {} tokens (budget: {})",
+                optimized.size(), usedTokens, availableTokens);
+
+        return optimized;
+    }
+
+    /**
+     * Compress message to key points for token efficiency
+     */
+    private String compressMessage(String content) {
+        if (content.length() <= 100) {
+            return content;
+        }
+
+        // Extract key elements: numbers, important words
+        String compressed = content;
+
+        // Keep numbers and currency
+        compressed = compressed.replaceAll("(?i)(what|how|can you|please|tell me|show me)", "");
+        compressed = compressed.replaceAll("\\s+", " ").trim();
+
+        // Truncate if still too long
+        if (compressed.length() > 150) {
+            compressed = compressed.substring(0, 147) + "...";
+        }
+
+        return compressed;
+    }
+
+    /**
+     * Create Spring AI message from AdminChatMessage
+     */
+    private org.springframework.ai.chat.messages.Message createMessage(AdminChatMessage msg) {
+        return createMessage(msg.getRole(), msg.getContent());
+    }
+
+    /**
+     * Create Spring AI message from role and content
+     */
+    private org.springframework.ai.chat.messages.Message createMessage(MessageType role, String content) {
+        if (role == MessageType.USER) {
+            return new UserMessage(content);
+        } else if (role == MessageType.ASSISTANT) {
+            return new org.springframework.ai.chat.messages.AssistantMessage(content);
+        } else {
+            return new SystemMessage(content);
+        }
+    }
+
+    /**
+     * Inner class to hold conversation context analysis
+     */
+    private static class ConversationContext {
+        List<String> topics = new ArrayList<>();
+        String lastDataPoint;
+        boolean isFollowUp;
+        boolean hasTopicSwitch;
+    }
+
+    /**
+     * Call OpenAI API with pre-built contextual messages
+     */
+    private String callOpenAIWithContext(List<org.springframework.ai.chat.messages.Message> messages) {
+        log.debug("Calling OpenAI with {} contextual messages", messages.size());
+
+        try {
+            // Create prompt with OpenAI options
+            org.springframework.ai.openai.OpenAiChatOptions options = org.springframework.ai.openai.OpenAiChatOptions.builder()
+                    .withModel("gpt-4-turbo")
+                    .withTemperature(0.7)
+                    .withMaxTokens(1500)
+                    .build();
+
+            Prompt prompt = new Prompt(messages, options);
+
+            // Call ChatClient
+            org.springframework.ai.chat.model.ChatResponse response = chatClient.prompt(prompt)
+                    .call()
+                    .chatResponse();
+
+            if (response == null || response.getResult() == null) {
+                log.warn("OpenAI returned null response");
+                return "I apologize, but I couldn't generate a response at this time. Please try rephrasing your question.";
+            }
+
+            // Extract AI response
+            String aiMessage = response.getResult().getOutput().getContent();
+
+            if (aiMessage == null || aiMessage.trim().isEmpty()) {
+                log.warn("OpenAI returned empty response content");
+                return "I apologize, but I couldn't generate a response at this time. Please try rephrasing your question.";
+            }
+
+            // Log token usage if available
+            if (response.getMetadata() != null && response.getMetadata().getUsage() != null) {
+                long totalTokens = response.getMetadata().getUsage().getTotalTokens();
+                log.info("OpenAI response generated - Tokens used: {}, Response length: {} chars",
+                        totalTokens, aiMessage.length());
+            } else {
+                log.info("OpenAI response generated successfully (length: {} chars)", aiMessage.length());
+            }
+
+            return aiMessage.trim();
+
+        } catch (Exception e) {
+            log.error("Error calling OpenAI API", e);
+            throw new RuntimeException("Failed to generate AI response: " + e.getMessage(), e);
+        }
+    }
+
+    /**
+     * Call OpenAI API with system prompt and conversation history
+     * Configured specifically for business insights generation
+     *
+     * @param systemPrompt The customized system prompt with business context
+     * @param history Conversation history for context
+     * @param userMessage Current user message
+     * @return AI-generated response
+     */
+    private String callOpenAI(String systemPrompt, List<AdminChatMessage> history, String userMessage) {
+        log.debug("Calling OpenAI with {} history messages", history.size());
+
+        try {
+            // 1. Build conversation history for context
+            List<org.springframework.ai.chat.messages.Message> messages = new ArrayList<>();
+
+            // 2. Add system message with business insights context
+            messages.add(new SystemMessage(systemPrompt));
+
+            // 3. Add conversation history
+            for (AdminChatMessage msg : history) {
+                if (msg.getRole() == MessageType.USER) {
+                    messages.add(new UserMessage(msg.getContent()));
+                } else if (msg.getRole() == MessageType.ASSISTANT) {
+                    messages.add(new org.springframework.ai.chat.messages.AssistantMessage(msg.getContent()));
+                }
+                // Note: SYSTEM messages from history are skipped (we use fresh system prompt)
+            }
+
+            // 4. Add current user message (if not already in history)
+            boolean currentMessageInHistory = history.stream()
+                    .anyMatch(msg -> msg.getContent().equals(userMessage) && msg.getRole() == MessageType.USER);
+
+            if (!currentMessageInHistory) {
+                messages.add(new UserMessage(userMessage));
+            }
+
+            // 5. Create prompt with OpenAI options
+            org.springframework.ai.openai.OpenAiChatOptions options = org.springframework.ai.openai.OpenAiChatOptions.builder()
+                    .withModel("gpt-4-turbo")
+                    .withTemperature(0.7)
+                    .withMaxTokens(1500)
+                    .build();
+
+            Prompt prompt = new Prompt(messages, options);
+
+            // 6. Call ChatClient
+            org.springframework.ai.chat.model.ChatResponse response = chatClient.prompt(prompt)
+                    .call()
+                    .chatResponse();
+
+            if (response == null || response.getResult() == null) {
+                log.warn("OpenAI returned null response");
+                return "I apologize, but I couldn't generate a response at this time. Please try rephrasing your question.";
+            }
+
+            // 7. Extract AI response
+            String aiMessage = response.getResult().getOutput().getContent();
+
+            if (aiMessage == null || aiMessage.trim().isEmpty()) {
+                log.warn("OpenAI returned empty response content");
+                return "I apologize, but I couldn't generate a response at this time. Please try rephrasing your question.";
+            }
+
+            // Log token usage if available
+            if (response.getMetadata() != null && response.getMetadata().getUsage() != null) {
+                long totalTokens = response.getMetadata().getUsage().getTotalTokens();
+                log.info("OpenAI response generated - Tokens used: {}, Response length: {} chars",
+                        totalTokens, aiMessage.length());
+            } else {
+                log.info("OpenAI response generated successfully (length: {} chars)", aiMessage.length());
+            }
+
+            return aiMessage.trim();
+
+        } catch (Exception e) {
+            log.error("Error calling OpenAI API", e);
+            throw new RuntimeException("Failed to generate AI response: " + e.getMessage(), e);
+        }
+    }
+
+    /**
+     * Build an error response for the admin
+     *
+     * @param errorMessage User-friendly error message
+     * @param processingTimeMs Time spent processing
+     * @return AdminChatResponse with error information
+     */
+    private AdminChatResponse buildErrorResponse(String errorMessage, long processingTimeMs) {
+        return AdminChatResponse.builder()
+                .message(errorMessage)
+                .conversationId(null)
+                .timestamp(LocalDateTime.now())
+                .processingTimeMs(processingTimeMs)
+                .sequenceNumber(0)
+                .tokenCount(0)
+                .charts(new ArrayList<>())
+                .build();
+    }
+
+    /**
+     * Update conversation metadata (message count and tokens)
+     *
+     * @param conversationId The conversation ID
+     * @param tokensUsed Tokens used in this interaction
+     */
+    @Transactional
+    public void updateConversationMetadata(UUID conversationId, long tokensUsed) {
+        log.debug("Updating conversation {} metadata with {} tokens", conversationId, tokensUsed);
+
+        conversationRepository.incrementMessageCountAndTokens(
+                conversationId,
+                tokensUsed,
+                LocalDateTime.now()
+        );
+    }
+
+    /**
+     * Format platform statistics as bullet points for system prompt
+     *
+     * @param stats Map of statistics
+     * @return Formatted string with bullet points and detailed metrics
+     */
+    private String formatPlatformStatsAsBulletPoints(Map<String, Object> stats) {
+        StringBuilder sb = new StringBuilder();
+
+        sb.append("\nCurrent Platform Metrics:\n");
+
+        // User Metrics
+        int totalUsers = (int) stats.get("totalUsers");
+        int activeUsers = (int) stats.get("activeUsers");
+        double monthlyGrowthRate = (double) stats.get("monthlyGrowthRate");
+        double activeUserPercentage = (activeUsers * 100.0) / totalUsers;
+
+        sb.append(String.format("• Total Users: %,d (↑%.1f%% this month)\n", totalUsers, monthlyGrowthRate));
+        sb.append(String.format("• Active Users: %,d (%.1f%%)\n", activeUsers, activeUserPercentage));
+        sb.append(String.format("• Active Today: %,d\n", (int) stats.get("activeUsersToday")));
+        sb.append(String.format("• New Users This Month: %,d\n", (int) stats.get("newUsersThisMonth")));
+
+        // Transaction Metrics
+        int totalTransactions = (int) stats.get("totalTransactions");
+        double successRate = (double) stats.get("transactionSuccessRate");
+
+        sb.append(String.format("• Total Transactions: %,d\n", totalTransactions));
+        sb.append(String.format("• Transactions Today: %,d\n", (int) stats.get("transactionsToday")));
+        sb.append(String.format("• Transaction Volume: %s\n", stats.get("transactionVolume")));
+        sb.append(String.format("• Average Transaction: ₦%,d\n", (long) stats.get("averageTransactionValue")));
+        sb.append(String.format("• Success Rate: %.1f%%\n", successRate));
+
+        // Revenue Metrics
+        double mrrGrowth = (double) stats.get("monthOverMonthGrowth");
+
+        sb.append(String.format("• Revenue Today: %s\n", stats.get("revenueToday")));
+        sb.append(String.format("• Revenue This Month: %s (↑%.1f%% MoM)\n",
+                stats.get("revenueThisMonth"), mrrGrowth));
+        sb.append(String.format("• Revenue Last Month: %s\n", stats.get("revenueLastMonth")));
+        sb.append(String.format("• MRR: %s\n", stats.get("monthlyRecurringRevenue")));
+        sb.append(String.format("• Card Fee Revenue: %s\n", stats.get("cardTransactionFeeRevenue")));
+
+        // Customer Economics
+        double ltvCacRatio = (double) stats.get("ltvToCacRatio");
+
+        sb.append(String.format("• Customer Acquisition Cost: %s\n", stats.get("customerAcquisitionCost")));
+        sb.append(String.format("• Lifetime Value: %s\n", stats.get("lifetimeValue")));
+        sb.append(String.format("• LTV:CAC Ratio: %.1f:1\n", ltvCacRatio));
+
+        // Feature Usage
+        sb.append(String.format("• Offline Transactions: %.1f%%\n", (double) stats.get("offlineTransactionPercentage")));
+        sb.append(String.format("• Card Transactions: %.1f%%\n", (double) stats.get("cardTransactionPercentage")));
+        sb.append(String.format("• Bill Payments: %.1f%%\n", (double) stats.get("billPaymentPercentage")));
+        sb.append(String.format("• P2P Transfers: %.1f%%\n", (double) stats.get("p2pTransferPercentage")));
+
+        // Performance & Operations
+        sb.append(String.format("• Peak Hours: %s\n", stats.get("peakHours")));
+        sb.append(String.format("• Average Response Time: %s\n", stats.get("averageResponseTime")));
+        sb.append(String.format("• Uptime: %s\n", stats.get("uptime")));
+
+        // Geographic Distribution
+        @SuppressWarnings("unchecked")
+        Map<String, Integer> topStates = (Map<String, Integer>) stats.get("topStatesByUsers");
+        sb.append("• Top States by Users:\n");
+        topStates.forEach((state, count) ->
+            sb.append(String.format("  - %s: %,d users\n", state, count))
+        );
+
+        // Top Categories
+        @SuppressWarnings("unchecked")
+        List<String> topCategories = (List<String>) stats.get("topCategories");
+        sb.append("• Top Transaction Categories: ");
+        sb.append(String.join(", ", topCategories));
+        sb.append("\n");
+
+        // Cache info
+        sb.append(String.format("\n(Stats generated: %s, expires: %s)\n",
+                stats.get("generatedAt"), stats.get("cacheExpiresAt")));
+
+        return sb.toString();
+    }
+
+    /**
+     * Categorize admin query into insight categories
+     *
+     * Analyzes the message content to determine what type of business insight
+     * is being requested. Used for context enhancement and analytics tracking.
+     *
+     * @param message The user's query message
+     * @return InsightCategory enum value
+     */
+    private InsightCategory categorizeQuery(String message) {
+        if (message == null || message.trim().isEmpty()) {
+            return InsightCategory.GENERAL_QUERY;
+        }
+
+        String lower = message.toLowerCase();
+
+        // Revenue analysis keywords
+        if (lower.contains("revenue") || lower.contains("income") || lower.contains("earnings") ||
+            lower.contains("mrr") || lower.contains("arr") || lower.contains("profit") ||
+            lower.contains("sales") || lower.contains("₦")) {
+            return InsightCategory.REVENUE_ANALYSIS;
+        }
+
+        // User growth keywords
+        if (lower.contains("user") || lower.contains("customer") || lower.contains("growth") ||
+            lower.contains("acquisition") || lower.contains("retention") || lower.contains("churn") ||
+            lower.contains("active") || lower.contains("signup")) {
+            return InsightCategory.USER_GROWTH;
+        }
+
+        // Transaction patterns keywords
+        if (lower.contains("transaction") || lower.contains("payment") || lower.contains("volume") ||
+            lower.contains("transfer") || lower.contains("success rate") || lower.contains("failure") ||
+            lower.contains("processed")) {
+            return InsightCategory.TRANSACTION_PATTERNS;
+        }
+
+        // Fee optimization keywords
+        if (lower.contains("fee") || lower.contains("pricing") || lower.contains("cost") ||
+            lower.contains("commission") || lower.contains("charge") || lower.contains("rate")) {
+            return InsightCategory.FEE_OPTIMIZATION;
+        }
+
+        // Risk assessment keywords
+        if (lower.contains("risk") || lower.contains("fraud") || lower.contains("security") ||
+            lower.contains("suspicious") || lower.contains("anomal") || lower.contains("threat")) {
+            return InsightCategory.RISK_ASSESSMENT;
+        }
+
+        // Market intelligence keywords
+        if (lower.contains("market") || lower.contains("competitor") || lower.contains("industry") ||
+            lower.contains("trend") || lower.contains("benchmark") || lower.contains("position")) {
+            return InsightCategory.MARKET_INTELLIGENCE;
+        }
+
+        // Default to general query
+        return InsightCategory.GENERAL_QUERY;
+    }
+
+    /**
+     * Build category-specific context for AI prompt
+     *
+     * Adds specialized context based on the query category to help the AI
+     * provide more focused and relevant insights.
+     *
+     * @param category The insight category
+     * @return Category-specific context string
+     */
+    private String buildCategoryContext(InsightCategory category) {
+        StringBuilder context = new StringBuilder();
+        context.append("**Current Query Category: ").append(category.getDisplayName()).append("**\n");
+        context.append(category.getDescription()).append("\n\n");
+
+        switch (category) {
+            case REVENUE_ANALYSIS:
+                context.append("Focus Areas:\n");
+                context.append("- Monthly Recurring Revenue (MRR) trends\n");
+                context.append("- Revenue growth rate and projections\n");
+                context.append("- Revenue breakdown by source (fees, subscriptions, etc.)\n");
+                context.append("- Average revenue per user (ARPU)\n");
+                context.append("- Revenue optimization opportunities\n\n");
+                context.append("Suggested Insights: Compare current vs. previous periods, identify top revenue sources, forecast future revenue.");
+                break;
+
+            case USER_GROWTH:
+                context.append("Focus Areas:\n");
+                context.append("- New user acquisition rate\n");
+                context.append("- Active user metrics (DAU, MAU)\n");
+                context.append("- User retention and churn rates\n");
+                context.append("- Customer lifetime value (LTV)\n");
+                context.append("- Growth drivers and obstacles\n\n");
+                context.append("Suggested Insights: Analyze growth trends, identify retention issues, recommend acquisition strategies.");
+                break;
+
+            case TRANSACTION_PATTERNS:
+                context.append("Focus Areas:\n");
+                context.append("- Transaction volume trends\n");
+                context.append("- Success vs. failure rates\n");
+                context.append("- Peak transaction times\n");
+                context.append("- Transaction categories breakdown\n");
+                context.append("- Average transaction value\n\n");
+                context.append("Suggested Insights: Identify patterns, detect anomalies, optimize processing times.");
+                break;
+
+            case FEE_OPTIMIZATION:
+                context.append("Focus Areas:\n");
+                context.append("- Current fee structure analysis\n");
+                context.append("- Fee revenue vs. costs\n");
+                context.append("- Competitive pricing comparison\n");
+                context.append("- Price elasticity and impact\n");
+                context.append("- Optimization recommendations\n\n");
+                context.append("Suggested Insights: Compare with market rates, suggest pricing adjustments, maximize revenue.");
+                break;
+
+            case RISK_ASSESSMENT:
+                context.append("Focus Areas:\n");
+                context.append("- Fraud detection patterns\n");
+                context.append("- Failed transaction analysis\n");
+                context.append("- Security incidents and trends\n");
+                context.append("- Risk exposure levels\n");
+                context.append("- Mitigation strategies\n\n");
+                context.append("Suggested Insights: Identify high-risk activities, recommend security improvements.");
+                break;
+
+            case MARKET_INTELLIGENCE:
+                context.append("Focus Areas:\n");
+                context.append("- Market positioning and share\n");
+                context.append("- Competitive landscape\n");
+                context.append("- Industry trends in Nigerian fintech\n");
+                context.append("- Growth opportunities\n");
+                context.append("- Strategic recommendations\n\n");
+                context.append("Suggested Insights: Analyze market trends, identify competitive advantages.");
+                break;
+
+            case GENERAL_QUERY:
+            default:
+                context.append("Provide comprehensive business insights based on available platform data.\n");
+                context.append("Focus on actionable recommendations and data-driven analysis.");
+                break;
+        }
+
+        return context.toString();
+    }
+
+    /**
+     * Generate conversation summary for long conversations
+     *
+     * Automatically summarizes conversations after every 10 messages to:
+     * - Extract key topics discussed
+     * - Identify important metrics and data points
+     * - Capture recommendations and insights provided
+     * - Track questions asked
+     *
+     * @param conversationId The conversation to summarize
+     * @return Generated summary or null if conversation too short
+     */
+    @Transactional
+    public String generateConversationSummary(UUID conversationId) {
+        log.info("Generating conversation summary for: {}", conversationId);
+
+        try {
+            // 1. Get all messages in conversation
+            List<AdminChatMessage> allMessages = chatMessageRepository
+                    .findByConversationIdOrderBySequenceNumberAsc(conversationId);
+
+            // 2. If < 10 messages, return null (no summary needed)
+            if (allMessages.size() < 10) {
+                log.debug("Conversation has only {} messages, skipping summarization", allMessages.size());
+                return null;
+            }
+
+            log.info("Summarizing conversation with {} messages", allMessages.size());
+
+            // 3. Extract key points for summary
+            List<String> topics = new ArrayList<>();
+            List<String> dataPoints = new ArrayList<>();
+            List<String> recommendations = new ArrayList<>();
+            List<String> questions = new ArrayList<>();
+
+            for (AdminChatMessage msg : allMessages) {
+                String content = msg.getContent();
+                String contentLower = content.toLowerCase();
+
+                // Extract topics
+                if (contentLower.contains("revenue") && !topics.contains("Revenue Analysis")) {
+                    topics.add("Revenue Analysis");
+                }
+                if (contentLower.contains("user") || contentLower.contains("customer")) {
+                    if (!topics.contains("User Growth")) topics.add("User Growth");
+                }
+                if (contentLower.contains("transaction")) {
+                    if (!topics.contains("Transaction Patterns")) topics.add("Transaction Patterns");
+                }
+                if (contentLower.contains("fee") || contentLower.contains("pricing")) {
+                    if (!topics.contains("Fee Optimization")) topics.add("Fee Optimization");
+                }
+
+                // Extract data points (metrics mentioned)
+                if (contentLower.contains("₦") && msg.getRole() == MessageType.ASSISTANT) {
+                    int start = content.indexOf("₦");
+                    int end = Math.min(start + 30, content.length());
+                    String dataPoint = content.substring(start, end).split("[\\n,.]")[0].trim();
+                    if (!dataPoint.isEmpty() && dataPoints.size() < 5) {
+                        dataPoints.add(dataPoint);
+                    }
+                }
+
+                // Extract recommendations (from assistant messages)
+                if (msg.getRole() == MessageType.ASSISTANT) {
+                    if (contentLower.contains("recommend") || contentLower.contains("suggest") ||
+                        contentLower.contains("should consider")) {
+                        // Extract sentence containing recommendation
+                        String[] sentences = content.split("[.!?]");
+                        for (String sentence : sentences) {
+                            if (sentence.toLowerCase().contains("recommend") ||
+                                sentence.toLowerCase().contains("suggest")) {
+                                if (recommendations.size() < 3) {
+                                    recommendations.add(sentence.trim());
+                                }
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                // Extract questions (from user messages)
+                if (msg.getRole() == MessageType.USER && content.contains("?")) {
+                    if (questions.size() < 5) {
+                        questions.add(content.trim());
+                    }
+                }
+            }
+
+            // 4. Build summary prompt
+            StringBuilder summaryPrompt = new StringBuilder();
+            summaryPrompt.append("Summarize this SyncPay business insights conversation in 3-4 concise bullet points.\n\n");
+            summaryPrompt.append("Focus on:\n");
+            summaryPrompt.append("- Main topics discussed\n");
+            summaryPrompt.append("- Key insights provided\n");
+            summaryPrompt.append("- Important metrics mentioned\n");
+            summaryPrompt.append("- Action items or recommendations\n\n");
+
+            summaryPrompt.append("Conversation Context:\n");
+            summaryPrompt.append("Total Messages: ").append(allMessages.size()).append("\n");
+
+            if (!topics.isEmpty()) {
+                summaryPrompt.append("Topics: ").append(String.join(", ", topics)).append("\n");
+            }
+
+            if (!dataPoints.isEmpty()) {
+                summaryPrompt.append("Key Metrics: ").append(String.join(", ", dataPoints)).append("\n");
+            }
+
+            if (!recommendations.isEmpty()) {
+                summaryPrompt.append("Recommendations Made: ").append(recommendations.size()).append("\n");
+            }
+
+            summaryPrompt.append("\nRecent conversation excerpt:\n");
+            // Include last 6 messages for context
+            int startIndex = Math.max(0, allMessages.size() - 6);
+            for (int i = startIndex; i < allMessages.size(); i++) {
+                AdminChatMessage msg = allMessages.get(i);
+                String role = msg.getRole() == MessageType.USER ? "Admin" : "AI";
+                String preview = msg.getContent().length() > 150
+                        ? msg.getContent().substring(0, 150) + "..."
+                        : msg.getContent();
+                summaryPrompt.append(role).append(": ").append(preview).append("\n");
+            }
+
+            // 5. Call ChatClient with summary prompt
+            log.debug("Calling AI to generate summary");
+            List<org.springframework.ai.chat.messages.Message> messages = new ArrayList<>();
+            messages.add(new SystemMessage(
+                    "You are a conversation summarizer. Create concise, actionable summaries " +
+                    "of business intelligence conversations. Use bullet points. Be specific about metrics and recommendations."
+            ));
+            messages.add(new UserMessage(summaryPrompt.toString()));
+
+            org.springframework.ai.openai.OpenAiChatOptions options = org.springframework.ai.openai.OpenAiChatOptions.builder()
+                    .withModel("gpt-4-turbo")
+                    .withTemperature(0.5) // Lower temperature for more focused summary
+                    .withMaxTokens(300) // Limit summary length
+                    .build();
+
+            Prompt prompt = new Prompt(messages, options);
+            org.springframework.ai.chat.model.ChatResponse response = chatClient.prompt(prompt)
+                    .call()
+                    .chatResponse();
+
+            if (response == null || response.getResult() == null) {
+                log.warn("Failed to generate summary - null response from AI");
+                return null;
+            }
+
+            String summary = response.getResult().getOutput().getContent();
+
+            if (summary == null || summary.trim().isEmpty()) {
+                log.warn("Failed to generate summary - empty response from AI");
+                return null;
+            }
+
+            summary = summary.trim();
+            log.info("Generated conversation summary ({} chars)", summary.length());
+
+            // 6. Save summary to conversation.conversationSummary field
+            AdminConversation conversation = conversationRepository
+                    .findByConversationId(conversationId)
+                    .orElse(null);
+
+            if (conversation != null) {
+                conversation.setConversationSummary(summary);
+
+                // 7. Also update subject if it's still the default
+                if (conversation.getSubject() == null ||
+                    conversation.getSubject().equals("Business Insights Chat")) {
+                    // Extract first topic as subject
+                    String subject = topics.isEmpty() ? "Business Insights Discussion" : topics.get(0);
+                    conversation.setSubject(subject);
+                }
+
+                conversationRepository.save(conversation);
+                log.info("Saved conversation summary to database");
+            }
+
+            // 8. Return summary
+            return summary;
+
+        } catch (Exception e) {
+            log.error("Error generating conversation summary for {}", conversationId, e);
+            return null;
+        }
+    }
+}

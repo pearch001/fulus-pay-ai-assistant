@@ -48,6 +48,18 @@ spring:
           model: ${OPENAI_MODEL:gpt-4-turbo}
           temperature: 0.7
           max-tokens: 1000
+      # Admin Insights AI Configuration
+      admin:
+        model: ${OPENAI_ADMIN_MODEL:gpt-4-turbo}
+        temperature: 0.7
+        max-tokens: 1500
+        timeout: 30s
+        retry:
+          max-attempts: 3
+          backoff:
+            initial-interval: 1s
+            multiplier: 2
+            max-interval: 10s
     chat:
       memory:
         type: postgresql
@@ -102,6 +114,45 @@ voice:
   cleanup:
     enabled: true
     age-hours: 24  # Delete audio files older than 24 hours
+
+# Admin Business Insights Configuration
+admin-insights:
+  enabled: ${ADMIN_INSIGHTS_ENABLED:true}
+
+  # Redis Cache Configuration for AI Responses
+  cache:
+    ttl: 300  # Cache TTL in seconds (5 minutes)
+    max-size: 100  # Maximum number of cached responses
+    enabled: true
+
+  # Rate Limiting Configuration
+  rate-limit:
+    requests-per-minute: 30  # Max requests per admin per minute
+    requests-per-hour: 100   # Max requests per admin per hour
+    enabled: true
+
+  # Conversation Management
+  conversation:
+    max-messages: 100        # Maximum messages per conversation
+    history-limit: 20        # Number of messages to include in context
+    cleanup-days: 30         # Delete inactive conversations after N days
+    auto-summarize-interval: 10  # Generate summary every N messages
+
+  # Platform Statistics
+  stats:
+    cache-duration: 300      # Cache duration in seconds (5 minutes)
+    refresh-interval: 300    # Stats refresh interval in seconds
+
+  # IP Whitelist (optional - for production security)
+  ip-whitelist:
+    enabled: false
+    allowed-ips: ${ADMIN_ALLOWED_IPS:127.0.0.1,::1}  # Comma-separated IP addresses
+
+  # Token Budget Management
+  token-budget:
+    max-context-tokens: 3000     # Maximum tokens for conversation context
+    reserved-for-response: 1500  # Tokens reserved for AI response
+    warning-threshold: 2500      # Log warning when approaching limit
 
 # Security & JWT Configuration
 security:

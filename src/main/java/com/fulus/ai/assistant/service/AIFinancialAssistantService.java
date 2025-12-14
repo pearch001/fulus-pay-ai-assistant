@@ -45,13 +45,21 @@ import java.util.concurrent.atomic.AtomicReference;
  * - Backpressure handling for streaming responses
  */
 @Service
-@RequiredArgsConstructor
 @Slf4j
 public class AIFinancialAssistantService {
 
     private final ChatClient chatClient;
     private final PostgreSQLChatMemoryProvider chatMemoryProvider;
     private final UserRepository userRepository;
+
+    public AIFinancialAssistantService(
+            @org.springframework.beans.factory.annotation.Qualifier("userChatClient") ChatClient chatClient,
+            PostgreSQLChatMemoryProvider chatMemoryProvider,
+            UserRepository userRepository) {
+        this.chatClient = chatClient;
+        this.chatMemoryProvider = chatMemoryProvider;
+        this.userRepository = userRepository;
+    }
 
     private static final String NIGERIAN_CURRENCY_SYMBOL = "₦";
     private static final DateTimeFormatter DATE_FORMATTER = DateTimeFormatter.ofPattern("EEEE, MMMM d, yyyy");
