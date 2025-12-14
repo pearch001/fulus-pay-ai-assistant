@@ -21,7 +21,7 @@ import java.util.Map;
 public class ChartData {
 
     /**
-     * Type of chart: "line", "bar", "pie", "doughnut", "area", etc.
+     * Type of chart: "line", "bar", "pie", "donut", "area"
      */
     @NotBlank(message = "Chart type cannot be empty")
     private String type;
@@ -35,27 +35,40 @@ public class ChartData {
     /**
      * Chart data - flexible structure to support various chart types
      * Examples:
-     * - For line/bar: {"values": [10, 20, 30], "datasets": [...]}
-     * - For pie: {"segments": [{"label": "A", "value": 10}, ...]}
+     * - For line/bar: [{"label": "A", "value": 10}, {"label": "B", "value": 20}]
+     * - For pie: [{"label": "Category A", "value": 10}, {"label": "Category B", "value": 20}]
      */
     @NotNull(message = "Chart data cannot be null")
-    private Map<String, Object> data;
+    private List<Map<String, Object>> data;
 
     /**
-     * Labels for X-axis or segments
-     * Example: ["Jan", "Feb", "Mar"] or ["Category A", "Category B"]
+     * Axis labels for the chart
      */
-    private List<String> labels;
-
-    /**
-     * Optional description or subtitle
-     */
-    private String description;
+    private ChartLabels labels;
 
     /**
      * Optional color scheme for the chart
      * Example: ["#FF6384", "#36A2EB", "#FFCE56"]
      */
     private List<String> colors;
+
+    /**
+     * Chart axis labels
+     */
+    @Data
+    @Builder
+    @NoArgsConstructor
+    @AllArgsConstructor
+    public static class ChartLabels {
+        /**
+         * X-axis label
+         */
+        private String x;
+
+        /**
+         * Y-axis label
+         */
+        private String y;
+    }
 }
 

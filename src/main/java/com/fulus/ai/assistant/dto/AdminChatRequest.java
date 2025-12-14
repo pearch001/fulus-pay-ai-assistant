@@ -38,4 +38,9 @@ public class AdminChatRequest {
      */
     @Builder.Default
     private Boolean includeCharts = false;
+
+    /**
+     * Optional preferred chart type: "line", "bar", "pie"
+     */
+    private String preferredChartType;
 }

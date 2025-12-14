@@ -2,6 +2,7 @@ package com.fulus.ai.assistant.service;
 
 import com.fulus.ai.assistant.dto.AdminChatRequest;
 import com.fulus.ai.assistant.dto.AdminChatResponse;
+import com.fulus.ai.assistant.dto.ChartData;
 import com.fulus.ai.assistant.entity.AdminChatMessage;
 import com.fulus.ai.assistant.entity.AdminConversation;
 import com.fulus.ai.assistant.entity.User;
@@ -44,6 +45,7 @@ public class AdminInsightsService {
     private final AdminInsightsCacheService cacheService;
     private final ChatClient chatClient;
     private final UserRepository userRepository;
+    private final ChartGenerationService chartGenerationService;
 
     private static final String SYSTEM_PROMPT_FILE = "admin-insights-system-prompt.txt";
     private static final DateTimeFormatter DATE_FORMATTER = DateTimeFormatter.ofPattern("EEEE, MMMM d, yyyy");
@@ -61,12 +63,14 @@ public class AdminInsightsService {
             AdminChatMessageRepository chatMessageRepository,
             @Qualifier("adminChatClient") ChatClient chatClient,
             UserRepository userRepository,
-            AdminInsightsCacheService cacheService) {
+            AdminInsightsCacheService cacheService,
+            ChartGenerationService chartGenerationService) {
         this.conversationRepository = conversationRepository;
         this.chatMessageRepository = chatMessageRepository;
         this.chatClient = chatClient;
         this.userRepository = userRepository;
         this.cacheService = cacheService;
+        this.chartGenerationService = chartGenerationService;
     }
 
     @PostConstruct
@@ -161,16 +165,42 @@ public class AdminInsightsService {
                 }
             }
 
-            // 6. Save assistant message
+            // 6. Generate charts if requested
+            List<ChartData> charts = new ArrayList<>();
+            String userMsgLower = request.getMessage().toLowerCase();
+
+            // Check if user wants visualization
+            boolean needsChart = Boolean.TRUE.equals(request.getIncludeCharts()) ||
+                                userMsgLower.contains("show") ||
+                                userMsgLower.contains("chart") ||
+                                userMsgLower.contains("graph") ||
+                                userMsgLower.contains("visualize") ||
+                                userMsgLower.contains("trend") ||
+                                userMsgLower.contains("plot") ||
+                                userMsgLower.contains("display");
+
+            if (needsChart) {
+                log.info("Chart generation triggered for query: {}", request.getMessage());
+                charts = chartGenerationService.generateCharts(request.getMessage());
+                log.info("Generated {} chart(s)", charts.size());
+            }
+
+            // 7. Save assistant message with chart metadata
             int aiTokens = calculateTokens(aiResponse);
+            Map<String, Object> metadata = new HashMap<>();
+            if (!charts.isEmpty()) {
+                metadata.put("charts", charts);
+            }
+
             AdminChatMessage assistantMessage = saveMessage(
                     conversation.getConversationId(),
                     "ASSISTANT",
                     aiResponse,
-                    aiTokens
+                    aiTokens,
+                    metadata
             );
 
-            // 7. Auto-summarize conversation if needed
+            // 8. Auto-summarize conversation if needed
             if (conversation.getMessageCount() % 10 == 0 && conversation.getMessageCount() >= 10) {
                 log.info("Triggering auto-summarization for conversation {} (message count: {})",
                         conversation.getConversationId(), conversation.getMessageCount());
@@ -186,7 +216,7 @@ public class AdminInsightsService {
                 }
             }
 
-            // 8. Build response
+            // 9. Build response with charts
             long processingTime = System.currentTimeMillis() - startTime;
             log.info("Successfully processed message for admin: {} (processing time: {}ms)", adminId, processingTime);
 
@@ -195,7 +225,9 @@ public class AdminInsightsService {
                     .conversationId(conversation.getConversationId())
                     .timestamp(LocalDateTime.now())
                     .processingTimeMs(processingTime)
-                    .charts(new ArrayList<>())
+                    .charts(charts)
+                    .sequenceNumber(assistantMessage.getSequenceNumber())
+                    .tokenCount(aiTokens)
                     .build();
 
         } catch (UnauthorizedException e) {
@@ -353,6 +385,11 @@ public class AdminInsightsService {
 
     @Transactional
     public AdminChatMessage saveMessage(UUID conversationId, String role, String content, int tokenCount) {
+        return saveMessage(conversationId, role, content, tokenCount, new HashMap<>());
+    }
+
+    @Transactional
+    public AdminChatMessage saveMessage(UUID conversationId, String role, String content, int tokenCount, Map<String, Object> metadata) {
         AdminConversation conversation = conversationRepository.findByConversationId(conversationId)
                 .orElseThrow(() -> new IllegalArgumentException("Conversation not found: " + conversationId));
 
@@ -368,7 +405,7 @@ public class AdminInsightsService {
         message.setTokenCount(finalTokenCount);
         message.setSequenceNumber(nextSequence);
         message.setCreatedAt(LocalDateTime.now());
-        message.setMetadata(new HashMap<>());
+        message.setMetadata(metadata != null ? metadata : new HashMap<>());
 
         AdminChatMessage saved = chatMessageRepository.save(message);
 
