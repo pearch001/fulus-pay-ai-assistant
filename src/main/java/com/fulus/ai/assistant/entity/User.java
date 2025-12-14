@@ -1,6 +1,7 @@
 package com.fulus.ai.assistant.entity;
 
 import com.fulus.ai.assistant.enums.KycStatus;
+import com.fulus.ai.assistant.enums.UserRole;
 import jakarta.persistence.*;
 import lombok.AllArgsConstructor;
 import lombok.Data;
@@ -41,6 +42,10 @@ public class User {
 
     @Column(nullable = true, length = 255)
     private String pin; // Numeric PIN stored hashed when user creates it
+    @Column(nullable = false, length = 20)
+    @Enumerated(EnumType.STRING)
+    private UserRole role = UserRole.USER; // User role (USER, ADMIN, SUPER_ADMIN)
+
 
     @Column(length = 11)
     private String bvn;

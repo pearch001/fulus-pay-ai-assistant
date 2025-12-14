@@ -28,15 +28,15 @@ public interface ChatMessageRepository extends JpaRepository<ChatMessage, UUID> 
     @Query("SELECT COUNT(m) FROM ChatMessage m WHERE m.conversationId = :conversationId")
     Long countByConversationId(@Param("conversationId") UUID conversationId);
 
-    @Modifying
+    @Modifying(clearAutomatically = true)
     @Query("DELETE FROM ChatMessage m WHERE m.conversationId = :conversationId")
-    void deleteByConversationId(@Param("conversationId") UUID conversationId);
+    int deleteByConversationId(@Param("conversationId") UUID conversationId);
 
-    @Modifying
+    @Modifying(clearAutomatically = true)
     @Query("DELETE FROM ChatMessage m WHERE m.timestamp < :cutoffDate")
     int deleteOldMessages(@Param("cutoffDate") LocalDateTime cutoffDate);
 
-    @Modifying
+    @Modifying(clearAutomatically = true)
     @Query(value = "DELETE FROM chat_messages WHERE id IN (SELECT id FROM chat_messages WHERE conversation_id = :conversationId ORDER BY sequence_number ASC LIMIT :limit)", nativeQuery = true)
-    void deleteOldestMessages(@Param("conversationId") UUID conversationId, @Param("limit") int limit);
+    int deleteOldestMessages(@Param("conversationId") UUID conversationId, @Param("limit") int limit);
 }

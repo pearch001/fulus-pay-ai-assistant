@@ -22,15 +22,15 @@ public interface ConversationRepository extends JpaRepository<Conversation, UUID
     @Query("SELECT c FROM Conversation c WHERE c.lastMessageAt < :cutoffDate AND c.archived = false")
     List<Conversation> findStaleConversations(@Param("cutoffDate") LocalDateTime cutoffDate);
 
-    @Modifying
+    @Modifying(clearAutomatically = true)
     @Query("UPDATE Conversation c SET c.messageCount = c.messageCount + 1, c.totalTokensUsed = c.totalTokensUsed + :tokens, c.lastMessageAt = :timestamp WHERE c.id = :conversationId")
-    void incrementMessageCountAndTokens(
+    int incrementMessageCountAndTokens(
         @Param("conversationId") UUID conversationId,
         @Param("tokens") Integer tokens,
         @Param("timestamp") LocalDateTime timestamp
     );
 
-    @Modifying
+    @Modifying(clearAutomatically = true)
     @Query("UPDATE Conversation c SET c.archived = true WHERE c.id = :conversationId")
-    void archiveConversation(@Param("conversationId") UUID conversationId);
+    int archiveConversation(@Param("conversationId") UUID conversationId);
 }

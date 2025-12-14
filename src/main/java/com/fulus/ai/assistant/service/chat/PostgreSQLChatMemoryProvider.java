@@ -18,6 +18,7 @@ public class PostgreSQLChatMemoryProvider {
 
     private final ChatMessageRepository chatMessageRepository;
     private final ConversationRepository conversationRepository;
+    private final ConversationService conversationService;
     private final int maxMessages;
     private final long cacheTtlSeconds;
 
@@ -27,11 +28,13 @@ public class PostgreSQLChatMemoryProvider {
     public PostgreSQLChatMemoryProvider(
             ChatMessageRepository chatMessageRepository,
             ConversationRepository conversationRepository,
+            ConversationService conversationService,
             @Value("${spring.ai.chat.memory.max-messages:20}") int maxMessages,
             @Value("${spring.ai.chat.memory.cache-ttl:3600}") long cacheTtlSeconds) {
 
         this.chatMessageRepository = chatMessageRepository;
         this.conversationRepository = conversationRepository;
+        this.conversationService = conversationService;
         this.maxMessages = maxMessages;
         this.cacheTtlSeconds = cacheTtlSeconds;
 
@@ -76,7 +79,8 @@ public class PostgreSQLChatMemoryProvider {
                 userId,
                 maxMessages,
                 chatMessageRepository,
-                conversationRepository
+                conversationRepository,
+                conversationService
         );
 
         // Cache it

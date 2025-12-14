@@ -1,6 +1,7 @@
 package com.fulus.ai.assistant.controller;
 
 import com.fulus.ai.assistant.dto.*;
+import com.fulus.ai.assistant.enums.UserRole;
 import com.fulus.ai.assistant.security.UserPrincipal;
 import com.fulus.ai.assistant.service.AuthenticationService;
 import jakarta.validation.Valid;
@@ -261,6 +262,79 @@ public class AuthController {
             log.error("Error during PIN reset", e);
             return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
                     .body(createErrorResponse("PIN reset failed. Please try again."));
+        }
+    }
+
+    /**
+     * Admin login with email and password
+     */
+    @PostMapping("/admin/login")
+    public ResponseEntity<?> adminLogin(@Valid @RequestBody AdminLoginRequest request) {
+        log.info("POST /api/v1/auth/admin/login - email: {}", request.getEmail());
+
+        try {
+            AdminAuthResponse response = authenticationService.adminLogin(request);
+            log.info("Admin logged in successfully: {} (Role: {})",
+                    request.getEmail(), response.getAdmin().getRole());
+            return ResponseEntity.ok(response);
+
+        } catch (BadCredentialsException e) {
+            log.warn("Admin login failed: Invalid credentials for {}", request.getEmail());
+            return ResponseEntity.status(HttpStatus.UNAUTHORIZED)
+                    .body(createErrorResponse("Invalid email or password"));
+
+        } catch (LockedException e) {
+            log.warn("Admin login failed: Account locked for {}", request.getEmail());
+            return ResponseEntity.status(HttpStatus.LOCKED)
+                    .body(createErrorResponse(e.getMessage()));
+
+        } catch (Exception e) {
+            log.error("Error during admin login", e);
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
+                    .body(createErrorResponse("Admin login failed. Please try again."));
+        }
+    }
+
+    /**
+     * Create admin user (requires SUPER_ADMIN role)
+     */
+    @PostMapping("/admin/create")
+    public ResponseEntity<?> createAdmin(
+            @Valid @RequestBody CreateAdminRequest request,
+            Authentication authentication) {
+
+        if (authentication == null || !authentication.isAuthenticated()) {
+            return ResponseEntity.status(HttpStatus.UNAUTHORIZED)
+                    .body(createErrorResponse("Not authenticated"));
+        }
+
+        UserPrincipal userPrincipal = (UserPrincipal) authentication.getPrincipal();
+
+        // Verify user is SUPER_ADMIN
+        if (userPrincipal.getRole() != UserRole.SUPER_ADMIN) {
+            log.warn("SECURITY ALERT: Non-super-admin user attempted to create admin - User ID: {}",
+                    userPrincipal.getId());
+            return ResponseEntity.status(HttpStatus.FORBIDDEN)
+                    .body(createErrorResponse("Access denied. Only SUPER_ADMIN can create admin users."));
+        }
+
+        log.info("POST /api/v1/auth/admin/create - phoneNumber: {} by creator: {}",
+                request.getPhoneNumber(), userPrincipal.getId());
+
+        try {
+            AdminAuthResponse response = authenticationService.createAdmin(request, userPrincipal.getId());
+            log.info("Admin user created successfully: {} (Role: {})",
+                    request.getPhoneNumber(), request.getRole());
+            return ResponseEntity.status(HttpStatus.CREATED).body(response);
+
+        } catch (IllegalArgumentException e) {
+            log.warn("Create admin failed: {}", e.getMessage());
+            return ResponseEntity.badRequest().body(createErrorResponse(e.getMessage()));
+
+        } catch (Exception e) {
+            log.error("Error during admin creation", e);
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
+                    .body(createErrorResponse("Admin creation failed. Please try again."));
         }
     }
 

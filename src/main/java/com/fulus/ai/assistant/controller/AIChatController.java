@@ -2,7 +2,11 @@ package com.fulus.ai.assistant.controller;
 
 import com.fulus.ai.assistant.dto.ChatRequest;
 import com.fulus.ai.assistant.dto.ChatResponse;
+import com.fulus.ai.assistant.security.UserPrincipal;
 import com.fulus.ai.assistant.service.AIFinancialAssistantService;
+import io.swagger.v3.oas.annotations.Operation;
+import io.swagger.v3.oas.annotations.security.SecurityRequirement;
+import io.swagger.v3.oas.annotations.tags.Tag;
 import jakarta.validation.Valid;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -11,13 +15,15 @@ import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.http.codec.ServerSentEvent;
+import org.springframework.security.core.annotation.AuthenticationPrincipal;
+import org.springframework.security.core.userdetails.UserDetails;
 import org.springframework.web.bind.annotation.*;
 import reactor.core.publisher.Flux;
 
-import java.time.Duration;
 import java.time.LocalDateTime;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.UUID;
 
 /**
  * REST Controller for AI Financial Assistant Chat
@@ -25,14 +31,16 @@ import java.util.List;
  * Endpoints:
  * - POST /api/v1/chat - Send message to AI assistant (blocking)
  * - POST /api/v1/chat/stream - Send message and stream response (SSE)
- * - GET /api/v1/chat/stream/{userId} - Stream response via GET (SSE)
- * - DELETE /api/v1/chat/history/{userId} - Clear conversation history
- * - GET /api/v1/chat/history/{userId} - Get conversation history (debug)
+ * - GET /api/v1/chat/stream - Stream response via GET (SSE)
+ * - DELETE /api/v1/chat/history - Clear conversation history
+ * - GET /api/v1/chat/history - Get conversation history (debug)
  */
 @RestController
 @RequestMapping("/api/v1/chat")
 @RequiredArgsConstructor
 @Slf4j
+@Tag(name = "AI Chat", description = "AI Financial Assistant Chat API")
+@SecurityRequirement(name = "Bearer Authentication")
 public class AIChatController {
 
     private final AIFinancialAssistantService aiAssistantService;
@@ -40,18 +48,24 @@ public class AIChatController {
     /**
      * Send a message to the AI assistant
      *
-     * @param request ChatRequest containing userId and message
+     * @param userDetails Authenticated user details from security context
+     * @param request ChatRequest containing message
      * @return ChatResponse with AI's response
      */
     @PostMapping
-    public ResponseEntity<ChatResponse> chat(@Valid @RequestBody ChatRequest request) {
-        log.info("Chat request received from user: {}", request.getUserId());
+    @Operation(summary = "Chat with AI assistant", description = "Send a message to the AI financial assistant")
+    public ResponseEntity<ChatResponse> chat(
+            @AuthenticationPrincipal UserDetails userDetails,
+            @Valid @RequestBody ChatRequest request) {
+
+        UUID userId = getUserId(userDetails);
+        log.info("Chat request received from user: {}", userId);
         log.debug("Message: {}", request.getMessage());
 
         try {
             // Process the query
             String aiResponse = aiAssistantService.processQuery(
-                    request.getUserId(),
+                    userId.toString(),
                     request.getMessage()
             );
 
@@ -60,7 +74,7 @@ public class AIChatController {
             List<ChatResponse.ConversationMessage> history = null;
 
             if (Boolean.TRUE.equals(request.getIncludeHistory())) {
-                List<Message> messages = aiAssistantService.getConversationHistory(request.getUserId());
+                List<Message> messages = aiAssistantService.getConversationHistory(userId.toString());
                 messageCount = messages.size();
 
                 // Convert to response format
@@ -80,13 +94,13 @@ public class AIChatController {
                     .success(true)
                     .message("Response generated successfully")
                     .response(aiResponse)
-                    .conversationId(request.getUserId())
+                    .conversationId(userId.toString())
                     .messageCount(messageCount)
                     .history(history)
                     .timestamp(LocalDateTime.now())
                     .build();
 
-            log.info("Chat response generated successfully for user: {}", request.getUserId());
+            log.info("Chat response generated successfully for user: {}", userId);
             return ResponseEntity.ok(response);
 
         } catch (IllegalArgumentException e) {
@@ -95,7 +109,7 @@ public class AIChatController {
             return ResponseEntity.badRequest().body(errorResponse);
 
         } catch (Exception e) {
-            log.error("Error processing chat request for user: {}", request.getUserId(), e);
+            log.error("Error processing chat request for user: {}", userId, e);
             ChatResponse errorResponse = ChatResponse.failure(
                     "An error occurred while processing your request. Please try again later."
             );
@@ -104,22 +118,24 @@ public class AIChatController {
     }
 
     /**
-     * Clear conversation history for a user
+     * Clear conversation history for authenticated user
      *
-     * @param userId The user ID
+     * @param userDetails Authenticated user details from security context
      * @return Success or error response
      */
-    @DeleteMapping("/history/{userId}")
-    public ResponseEntity<ChatResponse> clearHistory(@PathVariable String userId) {
+    @DeleteMapping("/history")
+    @Operation(summary = "Clear chat history", description = "Clear conversation history for the authenticated user")
+    public ResponseEntity<ChatResponse> clearHistory(@AuthenticationPrincipal UserDetails userDetails) {
+        UUID userId = getUserId(userDetails);
         log.info("Clear history request for user: {}", userId);
 
         try {
-            aiAssistantService.clearConversationHistory(userId);
+            aiAssistantService.clearConversationHistory(userId.toString());
 
             ChatResponse response = ChatResponse.builder()
                     .success(true)
                     .message("Conversation history cleared successfully")
-                    .conversationId(userId)
+                    .conversationId(userId.toString())
                     .timestamp(LocalDateTime.now())
                     .build();
 
@@ -136,17 +152,19 @@ public class AIChatController {
     }
 
     /**
-     * Get conversation history for a user (debug endpoint)
+     * Get conversation history for authenticated user (debug endpoint)
      *
-     * @param userId The user ID
+     * @param userDetails Authenticated user details from security context
      * @return Conversation history
      */
-    @GetMapping("/history/{userId}")
-    public ResponseEntity<ChatResponse> getHistory(@PathVariable String userId) {
+    @GetMapping("/history")
+    @Operation(summary = "Get chat history", description = "Retrieve conversation history for the authenticated user")
+    public ResponseEntity<ChatResponse> getHistory(@AuthenticationPrincipal UserDetails userDetails) {
+        UUID userId = getUserId(userDetails);
         log.info("Get history request for user: {}", userId);
 
         try {
-            List<Message> messages = aiAssistantService.getConversationHistory(userId);
+            List<Message> messages = aiAssistantService.getConversationHistory(userId.toString());
 
             // Convert to response format
             List<ChatResponse.ConversationMessage> history = new ArrayList<>();
@@ -162,7 +180,7 @@ public class AIChatController {
             ChatResponse response = ChatResponse.builder()
                     .success(true)
                     .message("Conversation history retrieved successfully")
-                    .conversationId(userId)
+                    .conversationId(userId.toString())
                     .messageCount(messages.size())
                     .history(history)
                     .timestamp(LocalDateTime.now())
@@ -184,15 +202,21 @@ public class AIChatController {
      * Stream AI response via Server-Sent Events (SSE)
      * POST endpoint for streaming with request body
      *
-     * @param request ChatRequest containing userId and message
+     * @param userDetails Authenticated user details from security context
+     * @param request ChatRequest containing message
      * @return Flux of ServerSentEvents with streaming tokens
      */
     @PostMapping(value = "/stream", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
-    public Flux<ServerSentEvent<String>> streamChat(@Valid @RequestBody ChatRequest request) {
-        log.info("Stream chat request received from user: {}", request.getUserId());
+    @Operation(summary = "Stream chat response", description = "Stream AI assistant response using Server-Sent Events")
+    public Flux<ServerSentEvent<String>> streamChat(
+            @AuthenticationPrincipal UserDetails userDetails,
+            @Valid @RequestBody ChatRequest request) {
+
+        UUID userId = getUserId(userDetails);
+        log.info("Stream chat request received from user: {}", userId);
         log.debug("Message: {}", request.getMessage());
 
-        return aiAssistantService.streamQueryWithRetry(request.getUserId(), request.getMessage())
+        return aiAssistantService.streamQueryWithRetry(userId.toString(), request.getMessage())
                 .map(token -> ServerSentEvent.<String>builder()
                         .id(String.valueOf(System.currentTimeMillis()))
                         .event("message")
@@ -204,10 +228,10 @@ public class AIChatController {
                                 .data("[DONE]")
                                 .build()
                 ))
-                .doOnComplete(() -> log.info("Stream completed for user: {}", request.getUserId()))
-                .doOnError(error -> log.error("Stream error for user: {}", request.getUserId(), error))
+                .doOnComplete(() -> log.info("Stream completed for user: {}", userId))
+                .doOnError(error -> log.error("Stream error for user: {}", userId, error))
                 .onErrorResume(throwable -> {
-                    log.error("Error in stream endpoint for user: {}", request.getUserId(), throwable);
+                    log.error("Error in stream endpoint for user: {}", userId, throwable);
                     return Flux.just(
                             ServerSentEvent.<String>builder()
                                     .event("error")
@@ -221,18 +245,21 @@ public class AIChatController {
      * Stream AI response via Server-Sent Events (SSE)
      * GET endpoint for streaming with query parameters
      *
-     * @param userId The user ID
+     * @param userDetails Authenticated user details from security context
      * @param message The user's message
      * @return Flux of ServerSentEvents with streaming tokens
      */
-    @GetMapping(value = "/stream/{userId}", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
+    @GetMapping(value = "/stream", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
+    @Operation(summary = "Stream chat response (GET)", description = "Stream AI assistant response using GET with query parameters")
     public Flux<ServerSentEvent<String>> streamChatGet(
-            @PathVariable String userId,
+            @AuthenticationPrincipal UserDetails userDetails,
             @RequestParam String message) {
+
+        UUID userId = getUserId(userDetails);
         log.info("Stream chat GET request received from user: {}", userId);
         log.debug("Message: {}", message);
 
-        return aiAssistantService.streamQueryWithProgress(userId, message)
+        return aiAssistantService.streamQueryWithProgress(userId.toString(), message)
                 .map(token -> ServerSentEvent.<String>builder()
                         .id(String.valueOf(System.currentTimeMillis()))
                         .event("message")
@@ -261,16 +288,32 @@ public class AIChatController {
      * Stream AI response as plain text (alternative to SSE)
      * Useful for simpler clients that don't need SSE format
      *
-     * @param request ChatRequest containing userId and message
+     * @param userDetails Authenticated user details from security context
+     * @param request ChatRequest containing message
      * @return Flux of text tokens
      */
     @PostMapping(value = "/stream/text", produces = MediaType.TEXT_PLAIN_VALUE)
-    public Flux<String> streamChatPlainText(@Valid @RequestBody ChatRequest request) {
-        log.info("Stream text request received from user: {}", request.getUserId());
+    @Operation(summary = "Stream chat response as plain text", description = "Stream AI response as plain text without SSE formatting")
+    public Flux<String> streamChatPlainText(
+            @AuthenticationPrincipal UserDetails userDetails,
+            @Valid @RequestBody ChatRequest request) {
 
-        return aiAssistantService.streamQueryWithRetry(request.getUserId(), request.getMessage())
-                .doOnComplete(() -> log.info("Text stream completed for user: {}", request.getUserId()))
-                .doOnError(error -> log.error("Text stream error for user: {}", request.getUserId(), error));
+        UUID userId = getUserId(userDetails);
+        log.info("Stream text request received from user: {}", userId);
+
+        return aiAssistantService.streamQueryWithRetry(userId.toString(), request.getMessage())
+                .doOnComplete(() -> log.info("Text stream completed for user: {}", userId))
+                .doOnError(error -> log.error("Text stream error for user: {}", userId, error));
+    }
+
+    /**
+     * Helper method to extract user ID from UserDetails
+     */
+    private UUID getUserId(UserDetails userDetails) {
+        if (userDetails instanceof UserPrincipal) {
+            return ((UserPrincipal) userDetails).getId();
+        }
+        throw new IllegalStateException("UserDetails is not an instance of UserPrincipal");
     }
 
     /**

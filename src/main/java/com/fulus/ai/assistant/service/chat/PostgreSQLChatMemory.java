@@ -12,7 +12,6 @@ import org.springframework.ai.chat.messages.Message;
 import org.springframework.ai.chat.messages.SystemMessage;
 import org.springframework.ai.chat.messages.UserMessage;
 import org.springframework.data.domain.PageRequest;
-import org.springframework.transaction.annotation.Transactional;
 
 import java.time.LocalDateTime;
 import java.util.*;
@@ -26,17 +25,20 @@ public class PostgreSQLChatMemory implements ChatMemory {
     private final int maxMessages;
     private final ChatMessageRepository chatMessageRepository;
     private final ConversationRepository conversationRepository;
+    private final ConversationService conversationService;
 
     public PostgreSQLChatMemory(
             UUID userId,
             int maxMessages,
             ChatMessageRepository chatMessageRepository,
-            ConversationRepository conversationRepository) {
+            ConversationRepository conversationRepository,
+            ConversationService conversationService) {
 
         this.userId = userId;
         this.maxMessages = maxMessages;
         this.chatMessageRepository = chatMessageRepository;
         this.conversationRepository = conversationRepository;
+        this.conversationService = conversationService;
 
         // Get or create conversation for this user
         this.conversationId = getOrCreateConversation();
@@ -45,7 +47,6 @@ public class PostgreSQLChatMemory implements ChatMemory {
     }
 
     @Override
-    @Transactional
     public void add(String conversationId, List<Message> messages) {
         log.debug("Adding {} messages to conversation {}", messages.size(), conversationId);
 
@@ -58,7 +59,6 @@ public class PostgreSQLChatMemory implements ChatMemory {
     }
 
     @Override
-    @Transactional(readOnly = true)
     public List<Message> get(String conversationId, int lastN) {
         log.debug("Retrieving last {} messages from conversation {}", lastN, conversationId);
 
@@ -76,7 +76,6 @@ public class PostgreSQLChatMemory implements ChatMemory {
     }
 
     @Override
-    @Transactional
     public void clear(String conversationId) {
         log.info("Clearing all messages from conversation {}", conversationId);
 
@@ -93,7 +92,6 @@ public class PostgreSQLChatMemory implements ChatMemory {
     /**
      * Add a single message to the conversation
      */
-    @Transactional
     private void addMessage(Message message) {
         Integer nextSequence = chatMessageRepository.findMaxSequenceNumber(conversationId) + 1;
 
@@ -130,7 +128,6 @@ public class PostgreSQLChatMemory implements ChatMemory {
     /**
      * Prune old messages when exceeding max limit
      */
-    @Transactional
     private void pruneOldMessages() {
         Long messageCount = chatMessageRepository.countByConversationId(conversationId);
 
@@ -144,7 +141,6 @@ public class PostgreSQLChatMemory implements ChatMemory {
     /**
      * Get or create conversation for the user
      */
-    @Transactional
     private UUID getOrCreateConversation() {
         Optional<Conversation> existing = conversationRepository.findByUserId(userId);
 
@@ -167,11 +163,11 @@ public class PostgreSQLChatMemory implements ChatMemory {
     }
 
     /**
-     * Update conversation metadata
+     * Update conversation metadata using Spring-managed service
+     * This ensures the @Modifying query runs in a proper transactional context
      */
-    @Transactional
     private void updateConversationMetadata(int tokens) {
-        conversationRepository.incrementMessageCountAndTokens(
+        conversationService.incrementMessageCountAndTokens(
                 conversationId,
                 tokens,
                 LocalDateTime.now()

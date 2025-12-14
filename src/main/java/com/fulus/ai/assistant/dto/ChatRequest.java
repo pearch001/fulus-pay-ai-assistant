@@ -1,7 +1,6 @@
 package com.fulus.ai.assistant.dto;
 
 import jakarta.validation.constraints.NotBlank;
-import jakarta.validation.constraints.NotNull;
 import jakarta.validation.constraints.Size;
 import lombok.AllArgsConstructor;
 import lombok.Builder;
@@ -17,9 +16,6 @@ import lombok.NoArgsConstructor;
 @AllArgsConstructor
 public class ChatRequest {
 
-    @NotNull(message = "User ID is required")
-    @NotBlank(message = "User ID cannot be empty")
-    private String userId;
 
     @NotBlank(message = "Message cannot be empty")
     @Size(min = 1, max = 2000, message = "Message must be between 1 and 2000 characters")

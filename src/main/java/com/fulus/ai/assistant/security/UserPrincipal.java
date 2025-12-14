@@ -1,6 +1,7 @@
 package com.fulus.ai.assistant.security;
 
 import com.fulus.ai.assistant.entity.User;
+import com.fulus.ai.assistant.enums.UserRole;
 import lombok.AllArgsConstructor;
 import lombok.Data;
 import org.springframework.security.core.GrantedAuthority;
@@ -25,6 +26,7 @@ public class UserPrincipal implements UserDetails {
     private String pin; // optional numeric PIN used for certain operations
     private boolean active;
     private boolean accountLocked;
+    private UserRole role; // User role
 
     /**
      * Create UserPrincipal from User entity
@@ -37,14 +39,15 @@ public class UserPrincipal implements UserDetails {
                 user.getPassword(),
                 user.getPin(),
                 user.isActive(),
-                user.isAccountLocked()
+                user.isAccountLocked(),
+                user.getRole() != null ? user.getRole() : UserRole.USER
         );
     }
 
     @Override
     public Collection<? extends GrantedAuthority> getAuthorities() {
-        // All users have ROLE_USER authority
-        return Collections.singletonList(new SimpleGrantedAuthority("ROLE_USER"));
+        // Return role-based authority
+        return Collections.singletonList(new SimpleGrantedAuthority("ROLE_" + role.name()));
     }
 
     @Override

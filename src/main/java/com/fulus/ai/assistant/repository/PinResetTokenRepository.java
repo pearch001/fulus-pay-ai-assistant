@@ -31,14 +31,14 @@ public interface PinResetTokenRepository extends JpaRepository<PinResetToken, UU
     /**
      * Delete expired tokens
      */
-    @Modifying
+    @Modifying(clearAutomatically = true)
     @Query("DELETE FROM PinResetToken p WHERE p.expiryDate < :now")
-    void deleteExpiredTokens(LocalDateTime now);
+    int deleteExpiredTokens(LocalDateTime now);
 
     /**
      * Invalidate all unused tokens for a user (security measure)
      */
-    @Modifying
+    @Modifying(clearAutomatically = true)
     @Query("UPDATE PinResetToken p SET p.used = true WHERE p.userId = :userId AND p.used = false")
-    void invalidateAllUserTokens(UUID userId);
+    int invalidateAllUserTokens(UUID userId);
 }

@@ -49,7 +49,7 @@ public interface UsedNonceRepository extends JpaRepository<UsedNonce, UUID> {
     /**
      * Delete expired nonces
      */
-    @Modifying
+    @Modifying(clearAutomatically = true)
     @Query("DELETE FROM UsedNonce n WHERE n.expiresAt < :now")
     int deleteExpiredNonces(@Param("now") LocalDateTime now);
 

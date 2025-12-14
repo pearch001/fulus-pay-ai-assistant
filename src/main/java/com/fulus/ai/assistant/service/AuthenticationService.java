@@ -8,6 +8,7 @@ import com.fulus.ai.assistant.entity.User;
 import com.fulus.ai.assistant.enums.TransactionCategory;
 import com.fulus.ai.assistant.enums.TransactionStatus;
 import com.fulus.ai.assistant.enums.TransactionType;
+import com.fulus.ai.assistant.enums.UserRole;
 import com.fulus.ai.assistant.repository.PinResetTokenRepository;
 import com.fulus.ai.assistant.repository.RefreshTokenRepository;
 import com.fulus.ai.assistant.repository.TransactionRepository;
@@ -195,6 +196,7 @@ public class AuthenticationService {
         user.setBalance(BigDecimal.ZERO);
         user.setActive(true);
         user.setFailedLoginAttempts(0);
+        user.setRole(UserRole.USER); // Set default role as USER
 
         // Generate virtual account number
         user.setAccountNumber(accountNumberGenerator.generateAccountNumber());
@@ -617,5 +619,178 @@ public class AuthenticationService {
 
         userRepository.save(user);
     }
-}
 
+    /**
+     * Admin login with email and password
+     */
+    @Transactional
+    public AdminAuthResponse adminLogin(AdminLoginRequest request) {
+        log.info("Admin login attempt for email: {}", request.getEmail());
+
+        // Find user by email
+        User user = userRepository.findByEmail(request.getEmail())
+                .orElseThrow(() -> {
+                    log.warn("Admin login failed: User not found - {}", request.getEmail());
+                    return new BadCredentialsException("Invalid email or password");
+                });
+
+        // Verify user is an admin
+        if (user.getRole() == null || user.getRole() == UserRole.USER) {
+            log.warn("SECURITY ALERT: Non-admin user attempted admin login - {}", request.getEmail());
+            throw new BadCredentialsException("Access denied. Admin privileges required.");
+        }
+
+        // Check if account is locked
+        if (user.isAccountLocked()) {
+            log.warn("Admin login blocked: Account locked for user {} until {}",
+                    request.getEmail(), user.getLockedUntil());
+            throw new LockedException(
+                    String.format("Account is temporarily locked due to multiple failed login attempts. " +
+                            "Please try again after %s.", user.getLockedUntil())
+            );
+        }
+
+        // Check if account is active
+        if (!user.isActive()) {
+            log.warn("Admin login blocked: Account inactive for user {}", request.getEmail());
+            throw new LockedException("Account is inactive. Please contact support.");
+        }
+
+        try {
+            // Authenticate using phone number as username (Spring Security UserDetails uses phone number)
+            Authentication authentication = authenticationManager.authenticate(
+                    new UsernamePasswordAuthenticationToken(
+                            user.getPhoneNumber(),
+                            request.getPassword()
+                    )
+            );
+
+            // Update login tracking
+            user.resetFailedAttempts();
+            user.setLastLoginAt(LocalDateTime.now());
+            userRepository.save(user);
+
+            log.info("Admin login successful for user: {} (ID: {}). Role: {}",
+                    request.getEmail(), user.getId(), user.getRole());
+
+            // Generate tokens
+            return generateAdminAuthResponse(user);
+
+        } catch (AuthenticationException e) {
+            // Increment failed attempts
+            handleFailedLogin(user);
+            log.warn("Admin login failed: Invalid password for user {} (Attempt {}/{})",
+                    request.getEmail(),
+                    user.getFailedLoginAttempts() != null ? user.getFailedLoginAttempts() : 0,
+                    maxFailedAttempts);
+            throw new BadCredentialsException("Invalid email or password");
+        }
+    }
+
+    /**
+     * Create admin user (requires SUPER_ADMIN authorization)
+     */
+    @Transactional
+    public AdminAuthResponse createAdmin(CreateAdminRequest request, UUID creatorId) {
+        log.info("Create admin request for phone number: {} by creator: {}", request.getPhoneNumber(), creatorId);
+
+        // Verify creator is super admin
+        User creator = userRepository.findById(creatorId)
+                .orElseThrow(() -> new IllegalArgumentException("Creator not found"));
+
+        if (creator.getRole() != UserRole.SUPER_ADMIN) {
+            log.warn("SECURITY ALERT: Non-super-admin user attempted to create admin - Creator ID: {}", creatorId);
+            throw new IllegalArgumentException("Access denied. Only SUPER_ADMIN can create admin users.");
+        }
+
+        // Validate role
+        if (request.getRole() == UserRole.USER) {
+            throw new IllegalArgumentException("Cannot create regular users through admin endpoint. Use registration endpoint.");
+        }
+
+        // Check if phone number already exists
+        if (userRepository.findByPhoneNumber(request.getPhoneNumber()).isPresent()) {
+            log.warn("Create admin failed: Phone number already exists - {}", request.getPhoneNumber());
+            throw new IllegalArgumentException("Phone number already registered");
+        }
+
+        // Check if email already exists
+        if (request.getEmail() != null && !request.getEmail().isEmpty()) {
+            if (userRepository.findByEmail(request.getEmail()).isPresent()) {
+                log.warn("Create admin failed: Email already exists - {}", request.getEmail());
+                throw new IllegalArgumentException("Email already registered");
+            }
+        }
+
+        // Confirm password match
+        if (!request.getPassword().equals(request.getConfirmPassword())) {
+            throw new IllegalArgumentException("Password and confirm password do not match");
+        }
+
+        // Create new admin user
+        User admin = new User();
+        admin.setPhoneNumber(request.getPhoneNumber());
+        admin.setName(request.getFullName());
+        admin.setEmail(request.getEmail());
+        admin.setPassword(passwordEncoder.encode(request.getPassword()));
+        admin.setRole(request.getRole());
+        admin.setActive(true);
+        admin.setFailedLoginAttempts(0);
+
+        // Admin users don't need account numbers, but set it to avoid null issues
+        admin.setAccountNumber("ADMIN-" + System.currentTimeMillis());
+        admin.setBalance(BigDecimal.ZERO);
+
+        admin = userRepository.save(admin);
+        log.info("Admin user created successfully: {} (ID: {}, Role: {})",
+                request.getPhoneNumber(), admin.getId(), admin.getRole());
+
+        // Generate tokens
+        return generateAdminAuthResponse(admin);
+    }
+
+    /**
+     * Generate admin authentication response with tokens
+     */
+    private AdminAuthResponse generateAdminAuthResponse(User admin) {
+        // Generate access token
+        String accessToken = tokenProvider.generateAccessToken(
+                admin.getId(),
+                admin.getPhoneNumber(),
+                admin.getName()
+        );
+
+        // Generate refresh token
+        String refreshTokenString = tokenProvider.generateRefreshToken(admin.getId());
+
+        // Save refresh token to database
+        RefreshToken refreshToken = RefreshToken.builder()
+                .token(refreshTokenString)
+                .userId(admin.getId())
+                .expiryDate(tokenProvider.getExpiryDateFromToken(refreshTokenString))
+                .revoked(false)
+                .build();
+
+        refreshTokenRepository.save(refreshToken);
+
+        // Build admin info
+        AdminAuthResponse.AdminUserInfo adminInfo = AdminAuthResponse.AdminUserInfo.builder()
+                .id(admin.getId())
+                .phoneNumber(admin.getPhoneNumber())
+                .name(admin.getName())
+                .email(admin.getEmail())
+                .role(admin.getRole())
+                .lastLoginAt(admin.getLastLoginAt())
+                .build();
+
+        // Calculate expiration in seconds
+        long expiresIn = tokenProvider.getAccessTokenExpiration() / 1000;
+
+        log.info("Admin tokens generated for user: {} (Role: {}, Access: {}s)",
+                admin.getPhoneNumber(),
+                admin.getRole(),
+                expiresIn);
+
+        return AdminAuthResponse.success(accessToken, refreshTokenString, expiresIn, adminInfo);
+    }
+}
