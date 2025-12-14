@@ -63,6 +63,42 @@ public class GlobalExceptionHandler {
         return buildErrorResponse(HttpStatus.INTERNAL_SERVER_ERROR, ex.getMessage(), "CHAT_MEMORY_ERROR");
     }
 
+    @ExceptionHandler(UnauthorizedException.class)
+    public ResponseEntity<Map<String, Object>> handleUnauthorizedException(UnauthorizedException ex) {
+        log.error("Unauthorized error: {}", ex.getMessage());
+        return buildErrorResponse(HttpStatus.FORBIDDEN, ex.getMessage(), "UNAUTHORIZED");
+    }
+
+    @ExceptionHandler(ConversationNotFoundException.class)
+    public ResponseEntity<Map<String, Object>> handleConversationNotFoundException(ConversationNotFoundException ex) {
+        log.error("Conversation not found error: {}", ex.getMessage());
+        return buildErrorResponse(HttpStatus.NOT_FOUND, ex.getMessage(), "CONVERSATION_NOT_FOUND");
+    }
+
+    @ExceptionHandler(UnauthorizedConversationAccessException.class)
+    public ResponseEntity<Map<String, Object>> handleUnauthorizedConversationAccessException(UnauthorizedConversationAccessException ex) {
+        log.error("Unauthorized conversation access error: {}", ex.getMessage());
+        return buildErrorResponse(HttpStatus.FORBIDDEN, ex.getMessage(), "UNAUTHORIZED_CONVERSATION_ACCESS");
+    }
+
+    @ExceptionHandler(RateLimitExceededException.class)
+    public ResponseEntity<Map<String, Object>> handleRateLimitExceededException(RateLimitExceededException ex) {
+        log.error("Rate limit exceeded error: {}", ex.getMessage());
+        return buildErrorResponse(HttpStatus.TOO_MANY_REQUESTS, ex.getMessage(), "RATE_LIMIT_EXCEEDED");
+    }
+
+    @ExceptionHandler(InvalidMessageException.class)
+    public ResponseEntity<Map<String, Object>> handleInvalidMessageException(InvalidMessageException ex) {
+        log.error("Invalid message error: {}", ex.getMessage());
+        return buildErrorResponse(HttpStatus.BAD_REQUEST, ex.getMessage(), "INVALID_MESSAGE");
+    }
+
+    @ExceptionHandler(AIServiceException.class)
+    public ResponseEntity<Map<String, Object>> handleAIServiceException(AIServiceException ex) {
+        log.error("AI service error: {}", ex.getMessage());
+        return buildErrorResponse(HttpStatus.SERVICE_UNAVAILABLE, ex.getMessage(), "AI_SERVICE_ERROR");
+    }
+
     @ExceptionHandler(MethodArgumentNotValidException.class)
     public ResponseEntity<Map<String, Object>> handleValidationException(MethodArgumentNotValidException ex) {
         String humanTs = LocalDateTime.now().format(HUMAN_FORMAT);
