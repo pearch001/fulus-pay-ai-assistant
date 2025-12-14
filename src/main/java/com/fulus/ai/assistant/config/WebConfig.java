@@ -32,11 +32,14 @@ public class WebConfig implements WebMvcConfigurer {
             headers = allowedHeaders.split(",");
         }
 
+        // Check if wildcard origin is used
+        boolean isWildcardOrigin = allowedOrigins.length == 1 && "*".equals(allowedOrigins[0]);
+
         registry.addMapping("/**")
-                .allowedOrigins(allowedOrigins)
+                .allowedOriginPatterns(isWildcardOrigin ? new String[]{"*"} : allowedOrigins)
                 .allowedMethods(allowedMethods.split(","))
                 .allowedHeaders(headers)
-                .allowCredentials(allowCredentials)
+                .allowCredentials(!isWildcardOrigin && allowCredentials)
                 .maxAge(maxAge);
     }
 }
